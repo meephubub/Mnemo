@@ -1,0 +1,13 @@
+[package]
+name = "mnemo-search"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Retrieval engine for Mnemo. Currently lexical/FTS5 (Phase 3); vector, hybrid fusion, and reranking land in later phases."
+
+[dependencies]
+mnemo-core = { workspace = true }
+mnemo-storage = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mnemo-core",
+    "crates/mnemo-storage",
+    "crates/mnemo-ingest",
+    "crates/mnemo-search",
+    "crates/mnemo-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Mnemo Contributors"]
+license = "MIT"
+repository = "https://github.com/meephubub/Mnemo"
+
+[workspace.dependencies]
+mnemo-core = { path = "crates/mnemo-core" }
+mnemo-storage = { path = "crates/mnemo-storage" }
+mnemo-ingest = { path = "crates/mnemo-ingest" }
+mnemo-search = { path = "crates/mnemo-search" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# package that lives at the workspace root and provides the public
+# `mnemo` facade crate described in plan.md section 62 (Core API / Crate Structure).
+[package]
+name = "mnemo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local-first, high-performance personal memory and knowledge engine for AI agents."
+
+[lib]
+name = "mnemo"
+path = "src/lib.rs"
+
+[dependencies]
+mnemo-core = { workspace = true }
+mnemo-storage = { workspace = true }
+mnemo-ingest = { workspace = true }
+mnemo-search = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
