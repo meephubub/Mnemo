@@ -30,8 +30,9 @@ crates/
   mnemo-core/                # data model, IDs, error type (no I/O)
   mnemo-storage/              # SQLite schema, migrations, repositories, FTS5
   mnemo-ingest/                # txt/md/html parsing + chunking (pure, no I/O beyond reading files)
-  mnemo-search/                 # lexical (BM25) search over the FTS5 indexes
-  mnemo-cli/                     # `mnemo` binary (init/ingest/search/profile/memory/stats)
+  mnemo-search/                 # lexical (BM25), vector (cosine), hybrid retrieval + context packing
+  mnemo-embeddings/              # Embedder trait + default HashingEmbedder (Phase 4)
+  mnemo-cli/                     # `mnemo` binary (init/ingest/search/embed/context/profile/memory/stats)
 ```
 
 ## Build everything
@@ -62,6 +63,17 @@ cargo run -p mnemo-cli -- --db mnemo.db ingest ./notes/*.md
 # Search everything that's been ingested
 cargo run -p mnemo-cli -- --db mnemo.db search "project deadline"
 cargo run -p mnemo-cli -- --db mnemo.db search --scope documents --limit 5 "quarterly report"
+cargo run -p mnemo-cli -- --db mnemo.db search --mode lexical "project deadline"
+cargo run -p mnemo-cli -- --db mnemo.db search --mode vector "project deadline"
+cargo run -p mnemo-cli -- --db mnemo.db search --mode hybrid --lexical-weight 0.3 --vector-weight 0.7 "project deadline"
+
+# Generate vector embeddings for all ingested chunks
+cargo run -p mnemo-cli -- --db mnemo.db embed
+cargo run -p mnemo-cli -- --db mnemo.db embed --rebuild
+
+# Pack search results into a token-budgeted context for prompt injection
+cargo run -p mnemo-cli -- --db mnemo.db context "project deadline" --token-budget 2000 --max-sources 5
+cargo run -p mnemo-cli -- --db mnemo.db context "project deadline" --mode lexical
 
 # Profile (small, stable key/value facts about the user)
 cargo run -p mnemo-cli -- --db mnemo.db profile set name "Ada"
@@ -96,7 +108,9 @@ mnemo = { path = "../mnemo" } # or a git dependency once published
 ```rust
 let db = mnemo::Mnemo::open("mnemo.db")?;
 db.ingest().ingest_file("notes.md").await?;
+db.embed().embed_pending().await?;
 let hits = db.search().search("project deadline").await?;
+let ctx = db.context().pack(Default::default()).await?;
 ```
 
 ## Checks
@@ -108,8 +122,9 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-No tests have been written yet (see `ROADMAP.md`) — `cargo test` will
-currently just confirm everything compiles.
+No tests have been written yet for `mnemo-storage` or `mnemo-ingest`
+repositories (see `ROADMAP.md`), but `mnemo-embeddings` and
+`mnemo-search` both include unit tests — `cargo test` will run those.
 
 ## Why no crates were added via `cargo add`
 
