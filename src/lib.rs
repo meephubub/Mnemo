@@ -15,28 +15,34 @@
 //! ```
 //!
 //! Each `Mnemo::*()` accessor (`profile`, `memories`, `ingest`,
-//! `conversations`, `search`) returns a small, `Clone`-able handle
-//! that shares the same underlying [`mnemo_storage::Db`] connection,
-//! so callers can freely pass handles around instead of the whole
-//! `Mnemo` value.
+//! `conversations`, `search`, `embed`, `context`) returns a small,
+//! `Clone`-able handle that shares the same underlying
+//! [`mnemo_storage::Db`] connection, so callers can freely pass
+//! handles around instead of the whole `Mnemo` value.
 
 mod blocking;
+mod context;
 mod conversation;
+mod embed;
 mod ingest;
 mod memory;
 mod profile;
 mod search;
 
+pub use context::{ContextChunk, ContextHandle, ContextRequest, PackedContext};
 pub use conversation::ConversationStore;
+pub use embed::EmbedHandle;
 pub use ingest::{IngestHandle, IngestOutcome};
 pub use memory::{MemoryProposal, MemoryStore};
 pub use profile::{ProfileHandle, ProfileProposal};
-pub use search::{HitKind, SearchHandle, SearchHit, SearchOptions, SearchScope};
+pub use search::{HitKind, HybridWeights, SearchHandle, SearchHit, SearchOptions, SearchScope};
 
 pub use mnemo_core::{ids, models, MnemoError, Result};
+pub use mnemo_embeddings::{Embedder, HashingEmbedder};
 pub use mnemo_ingest::parsers::FileKind;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use mnemo_storage::Db;
 
@@ -87,5 +93,35 @@ impl Mnemo {
     /// Query everything Mnemo has indexed (plan.md section 7 / Phase 3).
     pub fn search(&self) -> SearchHandle {
         SearchHandle::new(self.db.clone())
+    }
+
+    /// Generate and inspect vector embeddings using the default,
+    /// dependency-free [`HashingEmbedder`] (plan.md section 47 /
+    /// Phase 4). Use [`Self::embed_with`] to supply a real local
+    /// model instead.
+    pub fn embed(&self) -> EmbedHandle {
+        self.embed_with(Arc::new(HashingEmbedder::default_dim()))
+    }
+
+    /// Generate and inspect vector embeddings using a custom
+    /// [`Embedder`] implementation (e.g. an ONNX/Candle-backed model).
+    pub fn embed_with(&self, embedder: Arc<dyn Embedder>) -> EmbedHandle {
+        EmbedHandle::new(self.db.clone(), embedder)
+    }
+
+    /// Pack retrieval results into a token-budgeted context using the
+    /// default, dependency-free [`HashingEmbedder`] for the vector
+    /// half of retrieval (plan.md section 11 / Phase 7). Use
+    /// [`Self::context_with`] to supply a real local model instead —
+    /// and to reuse the same embedder [`Self::embed`] used when
+    /// embedding chunks, so query and stored vectors are comparable.
+    pub fn context(&self) -> ContextHandle {
+        self.context_with(Arc::new(HashingEmbedder::default_dim()))
+    }
+
+    /// Pack retrieval results into a token-budgeted context using a
+    /// custom [`Embedder`] implementation.
+    pub fn context_with(&self, embedder: Arc<dyn Embedder>) -> ContextHandle {
+        ContextHandle::new(self.db.clone(), embedder)
     }
 }

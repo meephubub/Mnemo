@@ -161,12 +161,40 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
+
+-- Embeddings: vector embeddings of chunk text (plan.md section 47
+-- "Local Embedding Models" / section 49 "Model Versioning" / Phase 4).
+-- `vector` is stored as a JSON array of f32 rather than a BLOB so the
+-- schema stays dependency-free (no custom SQLite functions needed to
+-- read it back); a real ANN index can replace brute-force scans over
+-- this table later without changing this table's shape.
+-- The unique constraint lets `count_pending`/`embed_pending` treat
+-- "chunk already embedded with the current model" as a single lookup,
+-- and re-embedding (e.g. after a model upgrade) as a plain upsert.
+CREATE TABLE IF NOT EXISTS embeddings (
+    id            TEXT PRIMARY KEY,
+    chunk_id      TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    model_name    TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    dimension     INTEGER NOT NULL,
+    vector        TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    UNIQUE(chunk_id, model_name, model_version)
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_chunk ON embeddings(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model_name, model_version);
 "#;
 
 /// Current schema version. Bump this and extend `apply` with a
 /// numbered migration step when the schema needs to change in a way
 /// that isn't safely idempotent (e.g. column removals/renames).
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 added the `embeddings` table (Phase 4). The `CREATE TABLE IF
+/// NOT EXISTS` above is itself idempotent/additive, so upgrading in
+/// place just means re-running `apply()`; this constant only exists
+/// to make the change visible in `schema_meta` and in future
+/// non-additive migrations.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Apply the full schema to `conn`. Safe to call on every startup.
 pub fn apply(conn: &Connection) -> Result<()> {

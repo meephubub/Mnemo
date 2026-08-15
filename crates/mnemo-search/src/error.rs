@@ -9,6 +9,12 @@ pub enum SearchError {
 
     #[error("invalid query: {0}")]
     InvalidQuery(String),
+
+    #[error("embedding error: {0}")]
+    Embedding(String),
+
+    #[error("reranking error: {0}")]
+    Rerank(String),
 }
 
 impl From<SearchError> for mnemo_core::MnemoError {

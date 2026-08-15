@@ -5,6 +5,10 @@ scaffolding commands were run to produce it — every `Cargo.toml` and
 source file was written by hand, so the commands below are the
 **first** commands you should run against this tree.
 
+This file is a reference, not a log — every command below is
+documented for you (or CI) to run manually; none have been executed
+in this environment.
+
 Nothing here needs network access beyond the crates.io downloads that
 `cargo build` performs itself.
 
@@ -28,12 +32,17 @@ Cargo.toml                 # workspace root + the `mnemo` facade package (src/li
 src/                        # the `mnemo` facade crate
 crates/
   mnemo-core/                # data model, IDs, error type (no I/O)
-  mnemo-storage/              # SQLite schema, migrations, repositories, FTS5
+  mnemo-storage/              # SQLite schema, migrations, repositories (incl. embeddings), FTS5
   mnemo-ingest/                # txt/md/html parsing + chunking (pure, no I/O beyond reading files)
-  mnemo-search/                 # lexical (BM25), vector (cosine), hybrid retrieval + context packing
-  mnemo-embeddings/              # Embedder trait + default HashingEmbedder (Phase 4)
-  mnemo-cli/                     # `mnemo` binary (init/ingest/search/embed/context/profile/memory/stats)
+  mnemo-embeddings/             # Embedder trait + default HashingEmbedder (Phase 4)
+  mnemo-search/                  # lexical (BM25), vector (cosine), hybrid fusion retrieval
+  mnemo-cli/                      # `mnemo` binary — not covered by this file; see ROADMAP.md scope note
 ```
+
+`mnemo-embeddings` is now a workspace member and a dependency of both
+`mnemo-search` and the top-level `mnemo` facade (it previously existed
+as source but wasn't wired into the workspace at all — see
+`ROADMAP.md`).
 
 ## Build everything
 
@@ -49,10 +58,20 @@ cargo build --workspace --release
 
 ## Run the CLI
 
-The CLI binary is named `mnemo` (crate `mnemo-cli`). Every command
-opens/creates a database file given via `--db` (defaults to
-`mnemo.db` in the current directory), so there's no separate "init"
-step required — but an explicit `init` command exists too:
+The CLI binary is named `mnemo` (crate `mnemo-cli`). Per project
+direction, `mnemo-cli` is out of scope for the work tracked in
+`ROADMAP.md` — it has **not** been extended alongside the `mnemo`
+facade, so it only exposes what was already wired into
+`crates/mnemo-cli/src/main.rs` before this pass: `init`, `ingest`,
+`search` (lexical only, no `--mode`/vector/hybrid flags), `profile`,
+`memory`, `stats`. There is **no** `embed` or `context` subcommand —
+those facade features (`Mnemo::embed()`, `Mnemo::context()`) are
+currently only reachable from Rust code, not the CLI.
+
+Every command opens/creates a database file given via `--db`
+(defaults to `mnemo.db` in the current directory), so there's no
+separate "init" step required — but an explicit `init` command exists
+too:
 
 ```sh
 cargo run -p mnemo-cli -- --db mnemo.db init
@@ -60,20 +79,9 @@ cargo run -p mnemo-cli -- --db mnemo.db init
 # Ingest documents (.txt, .md, .html)
 cargo run -p mnemo-cli -- --db mnemo.db ingest ./notes/*.md
 
-# Search everything that's been ingested
+# Search everything that's been ingested (lexical/BM25 only)
 cargo run -p mnemo-cli -- --db mnemo.db search "project deadline"
 cargo run -p mnemo-cli -- --db mnemo.db search --scope documents --limit 5 "quarterly report"
-cargo run -p mnemo-cli -- --db mnemo.db search --mode lexical "project deadline"
-cargo run -p mnemo-cli -- --db mnemo.db search --mode vector "project deadline"
-cargo run -p mnemo-cli -- --db mnemo.db search --mode hybrid --lexical-weight 0.3 --vector-weight 0.7 "project deadline"
-
-# Generate vector embeddings for all ingested chunks
-cargo run -p mnemo-cli -- --db mnemo.db embed
-cargo run -p mnemo-cli -- --db mnemo.db embed --rebuild
-
-# Pack search results into a token-budgeted context for prompt injection
-cargo run -p mnemo-cli -- --db mnemo.db context "project deadline" --token-budget 2000 --max-sources 5
-cargo run -p mnemo-cli -- --db mnemo.db context "project deadline" --mode lexical
 
 # Profile (small, stable key/value facts about the user)
 cargo run -p mnemo-cli -- --db mnemo.db profile set name "Ada"
@@ -93,7 +101,9 @@ cargo run -p mnemo-cli -- --db mnemo.db stats
 
 After a release build, the binary is at
 `target/release/mnemo` and can be run directly instead of via
-`cargo run`.
+`cargo run`. See "Using `mnemo` as a library" below for
+embed/vector/hybrid/context usage, which for now requires writing a
+few lines of Rust rather than a CLI flag.
 
 ## Using `mnemo` as a library
 
@@ -108,10 +118,43 @@ mnemo = { path = "../mnemo" } # or a git dependency once published
 ```rust
 let db = mnemo::Mnemo::open("mnemo.db")?;
 db.ingest().ingest_file("notes.md").await?;
-db.embed().embed_pending().await?;
+
+// Lexical (BM25) search — always available, no embedding step needed.
 let hits = db.search().search("project deadline").await?;
-let ctx = db.context().pack(Default::default()).await?;
+
+// Vector / hybrid search (Phase 4/5): embed pending chunks once, then
+// reuse the same embedder handle for query embedding so model/version
+// match what's stored.
+let embed = db.embed(); // default HashingEmbedder; use db.embed_with(..) for a real model
+embed.embed_pending().await?;
+let embedder = embed.embedder();
+
+let vector_hits = db.search().search_vector(embedder.clone(), "project deadline", 10).await?;
+let hybrid_hits = db
+    .search()
+    .search_hybrid(
+        embedder.clone(),
+        "project deadline",
+        mnemo::SearchOptions::default(),
+        mnemo::HybridWeights::default(),
+    )
+    .await?;
+
+// Context packing (Phase 7): fuse + dedupe + greedily pack into a
+// token budget, capped at a number of distinct sources, with full
+// `Source` records attached for citation rendering.
+let packed = db.context_with(embedder).pack("project deadline", 2000).await?;
+for chunk in &packed.chunks {
+    println!("[{} tok] {}", chunk.estimated_tokens, chunk.hit.text);
+}
+println!("used {} tokens across {} sources", packed.estimated_tokens, packed.sources.len());
 ```
+
+`db.context()` (no embedder argument) uses the same default
+`HashingEmbedder` as `db.embed()`; use `db.context_with(embedder)` to
+reuse a real model's embedder instance so query and stored vectors
+are comparable. Reranking (Phase 6) is not implemented yet — see
+`ROADMAP.md`'s "Not started" / "Suggested next steps" sections.
 
 ## Checks
 
@@ -124,7 +167,22 @@ cargo test --workspace
 
 No tests have been written yet for `mnemo-storage` or `mnemo-ingest`
 repositories (see `ROADMAP.md`), but `mnemo-embeddings` and
-`mnemo-search` both include unit tests — `cargo test` will run those.
+`mnemo-search` (lexical/vector/hybrid search plus context packing)
+both include unit tests — `cargo test` will run those.
+
+To verify just the Phase 4 (embeddings)/Phase 5 (hybrid retrieval)/
+Phase 7 (context packing) work without running the whole workspace
+suite:
+
+```sh
+cargo check -p mnemo-storage -p mnemo-embeddings -p mnemo-search -p mnemo
+cargo test -p mnemo-search
+cargo test -p mnemo-embeddings
+```
+
+None of the commands in this file have been run in this environment —
+they're recorded here so the exact build/test/lint steps are known,
+per project direction to document commands rather than execute them.
 
 ## Why no crates were added via `cargo add`
 

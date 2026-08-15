@@ -5,9 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Retrieval engine for Mnemo. Currently lexical/FTS5 (Phase 3); vector, hybrid fusion, and reranking land in later phases."
+description = "Retrieval engine for Mnemo. Lexical/FTS5 (Phase 3), brute-force vector search and score-fusion hybrid retrieval (Phase 4/5), token-budgeted context packing (Phase 7); reranking (Phase 6) lands in a later pass."
 
 [dependencies]
 mnemo-core = { workspace = true }
 mnemo-storage = { workspace = true }
+mnemo-embeddings = { workspace = true }
 thiserror = { workspace = true }

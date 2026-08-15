@@ -4,6 +4,7 @@ members = [
     "crates/mnemo-core",
     "crates/mnemo-storage",
     "crates/mnemo-ingest",
+    "crates/mnemo-embeddings",
     "crates/mnemo-search",
     "crates/mnemo-cli",
 ]
@@ -19,6 +20,7 @@ repository = "https://github.com/meephubub/Mnemo"
 mnemo-core = { path = "crates/mnemo-core" }
 mnemo-storage = { path = "crates/mnemo-storage" }
 mnemo-ingest = { path = "crates/mnemo-ingest" }
+mnemo-embeddings = { path = "crates/mnemo-embeddings" }
 mnemo-search = { path = "crates/mnemo-search" }
 
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +55,7 @@ path = "src/lib.rs"
 mnemo-core = { workspace = true }
 mnemo-storage = { workspace = true }
 mnemo-ingest = { workspace = true }
+mnemo-embeddings = { workspace = true }
 mnemo-search = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
