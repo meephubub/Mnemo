@@ -24,6 +24,29 @@ to build/run what exists so far.
 - **Phase 3 — Full-Text Search.** FTS5 virtual tables + triggers for
   `chunks` and `messages`, BM25 ranking, lexical search across both
   scopes via `mnemo_search::search` / `Mnemo::search()`.
+- **Phase 4 — Embeddings.** `mnemo-embeddings` crate defines an
+  `Embedder` trait and a default `HashingEmbedder` (deterministic,
+  dependency-free, L2-normalized vectors via the hashing trick).
+  `Embedding` model + `embeddings` table/repository in storage.
+  `Mnemo::embed()` handle with `embed_pending()` (incremental — only
+  chunks lacking an embedding for the current model version are
+  processed), `count()`, `count_pending()`, `clear()`, `get()`.
+  Schema version bumped to 2. **Not done:** real ONNX/Candle model
+  integration (the trait is ready for it), embedding cache, ANN index
+  (currently brute-force cosine over all stored vectors).
+- **Phase 5 — Hybrid Retrieval.** `RetrievalMode` enum
+  (`Lexical`/`Vector`/`Hybrid`) on `SearchOptions`. `vector_search()`
+  does brute-force cosine similarity over stored embeddings.
+  `hybrid_search()` fuses lexical + vector signals via min-max
+  normalized weighted score fusion (plan.md section 8). Default mode
+  is `Hybrid`. Configurable `lexical_weight`/`vector_weight`.
+- **Phase 7 — Context Packing.** `Mnemo::context()` handle with
+  `pack()` / `pack_with_options()`. `pack_context()` searches,
+  deduplicates near-identical chunks (same 100-char prefix), greedily
+  packs into a token budget (~4 chars/token heuristic), respects
+  `max_sources`, and returns `PackedContext` with `ContextChunk`s
+  carrying citation metadata. `ContextRequest` struct with
+  `query`/`token_budget`/`max_sources`.
 
 ## Not started
 
@@ -31,13 +54,8 @@ Everything below is unimplemented; the facade's public API
 (`SearchHit.score`, `SearchScope`, etc.) was designed so these can be
 added without breaking existing callers.
 
-- **Phase 4 — Embeddings.** No embedding model integration, no vector
-  column/index.
-- **Phase 5 — Hybrid Retrieval.** No score fusion between lexical and
-  vector signals (there's only lexical today).
-- **Phase 6 — Reranking.**
-- **Phase 7 — Context Packing.** Callers currently get raw
-  `SearchHit`s; no token-budget-aware assembly of a final context.
+- **Phase 6 — Reranking.** No two-stage reranker; `mnemo_search`
+  returns fused results directly.
 - **Phase 8 — Conversation Memory.** Conversations/messages are
   stored and searchable, but there's no summarization or
   memory-extraction pipeline over them yet.
@@ -82,11 +100,14 @@ added without breaking existing callers.
 
 1. Add `cargo test` coverage for `mnemo-ingest` chunking/parsing and
    `mnemo-storage` repositories (currently untested).
-2. Phase 4/5: pick an embedding approach and add a `vector` column +
-   index, then fuse it with the existing BM25 scores in
-   `mnemo_search::search`.
+2. Phase 6: implement a reranker abstraction (`trait Reranker`) and
+   wire it into the hybrid search pipeline as an optional second stage
+   (plan.md section 10).
 3. Phase 2: add PDF/DOCX parsers behind the existing `FileKind`
    enum in `mnemo-ingest`.
 4. Phase 10: implement the promotion/decay policy described in
    plan.md sections 24-26 as a function callers can run periodically
    over `MemoryStore::list(Some(MemoryStatus::Candidate))`.
+5. Phase 4: replace `HashingEmbedder` with a real local embedding
+   model (ONNX/Candle) behind the existing `Embedder` trait, and add
+   an ANN index for sub-linear vector search at scale.
