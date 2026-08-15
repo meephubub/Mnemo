@@ -1,0 +1,12 @@
+[package]
+name = "mnemo-embeddings"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedding abstraction for Mnemo (Phase 4). Trait + default hashing embedder; local ONNX/Candle models slot in later."
+
+[dependencies]
+mnemo-core = { workspace = true }
+thiserror = { workspace = true }
