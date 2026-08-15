@@ -28,6 +28,9 @@ pub enum MnemoError {
     #[error("search error: {0}")]
     Search(String),
 
+    #[error("embedding error: {0}")]
+    Embedding(String),
+
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
