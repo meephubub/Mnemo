@@ -74,6 +74,16 @@ enum ProfileCommand {
     List,
     /// Remove a profile key.
     Remove { key: String },
+    /// Propose a profile update subject to the confidence policy
+    /// (plan.md section 22): >= 0.85 writes immediately, 0.50-0.84
+    /// needs confirmation (use `memory propose` instead), < 0.50 is
+    /// rejected.
+    Propose {
+        key: String,
+        value: String,
+        #[arg(long)]
+        confidence: f32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +101,24 @@ enum MemoryCommand {
     },
     /// Permanently delete a memory by id.
     Remove { id: String },
+    /// Propose a memory subject to the confidence policy (plan.md
+    /// section 22): >= 0.85 saves as Active, 0.50-0.84 saves as a
+    /// Candidate for later review, < 0.50 is rejected outright.
+    Propose {
+        content: Vec<String>,
+        #[arg(long, value_enum, default_value = "fact")]
+        r#type: MemoryTypeArg,
+        #[arg(long)]
+        confidence: f32,
+    },
+    /// Promote Candidate memories to Active once they clear an
+    /// importance bar.
+    Promote {
+        #[arg(long, default_value_t = 0.5)]
+        min_importance: f32,
+    },
+    /// Expire Temporary memories whose valid-until date has passed.
+    ExpireTemporary,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

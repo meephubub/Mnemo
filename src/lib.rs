@@ -29,8 +29,8 @@ mod search;
 
 pub use conversation::ConversationStore;
 pub use ingest::{IngestHandle, IngestOutcome};
-pub use memory::MemoryStore;
-pub use profile::ProfileHandle;
+pub use memory::{MemoryProposal, MemoryStore};
+pub use profile::{ProfileHandle, ProfileProposal};
 pub use search::{HitKind, SearchHandle, SearchHit, SearchOptions, SearchScope};
 
 pub use mnemo_core::{ids, models, MnemoError, Result};

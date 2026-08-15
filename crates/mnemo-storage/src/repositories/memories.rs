@@ -105,3 +105,43 @@ pub fn delete(conn: &Connection, id: MemoryId) -> Result<()> {
     conn.execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])?;
     Ok(())
 }
+
+pub fn set_importance(conn: &Connection, id: MemoryId, importance: f32) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET importance = ?1 WHERE id = ?2",
+        params![importance, id.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn set_valid_range(
+    conn: &Connection,
+    id: MemoryId,
+    valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET valid_from = ?1, valid_until = ?2 WHERE id = ?3",
+        params![opt_dt_to_str(valid_from), opt_dt_to_str(valid_until), id.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn touch_last_accessed(conn: &Connection, id: MemoryId) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET last_accessed = ?1 WHERE id = ?2",
+        params![dt_to_str(chrono::Utc::now()), id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Temporary memories whose `valid_until` has already passed
+/// (plan.md section 25: `CANDIDATE -> TEMPORARY -> EXPIRE`).
+pub fn list_expired_temporary(conn: &Connection, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE status = 'TEMPORARY' AND valid_until IS NOT NULL AND valid_until <= ?1
+         ORDER BY valid_until ASC",
+    )?;
+    let rows = stmt.query_map(params![dt_to_str(now)], from_row)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}

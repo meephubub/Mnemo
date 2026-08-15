@@ -1,10 +1,24 @@
 //! Profile API surface (plan.md sections 20-22).
 
-use mnemo_core::models::ProfileEntry;
+use mnemo_core::models::{Memory, MemoryDecision, ProfileEntry};
 use mnemo_core::Result;
 use mnemo_storage::{repositories::profile as repo, Db};
 
 use crate::blocking;
+
+/// Outcome of [`ProfileHandle::propose`] (plan.md section 22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileProposal {
+    /// Confidence >= 0.85: the key was written immediately.
+    Saved,
+    /// Confidence 0.50-0.84: not written to the profile. Route this
+    /// through [`crate::memory::MemoryStore::propose`] as a
+    /// `Candidate` memory instead and promote it into the profile
+    /// once confirmed.
+    NeedsConfirmation,
+    /// Confidence < 0.50: discarded outright.
+    Rejected,
+}
 
 /// Handle for reading and updating the small, stable user profile.
 ///
@@ -63,5 +77,28 @@ impl ProfileHandle {
             Ok(())
         })
         .await
+    }
+
+    /// Apply the plan.md section 22 confidence policy to a proposed
+    /// profile update instead of writing it unconditionally. `>=
+    /// 0.85` writes the key immediately; `0.50-0.84` and `< 0.50` are
+    /// left for the caller to route through
+    /// [`crate::memory::MemoryStore::propose`] (as a review candidate)
+    /// or discard, respectively — nothing is written to the profile
+    /// in either of those cases.
+    pub async fn propose(
+        &self,
+        key: impl Into<String> + Send + 'static,
+        value: impl Into<String> + Send + 'static,
+        confidence: f32,
+    ) -> Result<ProfileProposal> {
+        match Memory::decide(confidence) {
+            MemoryDecision::AutoSave => {
+                self.set(key, value, confidence).await?;
+                Ok(ProfileProposal::Saved)
+            }
+            MemoryDecision::Candidate => Ok(ProfileProposal::NeedsConfirmation),
+            MemoryDecision::Reject => Ok(ProfileProposal::Rejected),
+        }
     }
 }

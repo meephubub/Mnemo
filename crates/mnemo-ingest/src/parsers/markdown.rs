@@ -66,3 +66,46 @@ pub fn parse(raw: &str) -> Result<(Option<String>, Vec<MarkdownSection>)> {
 
     Ok((title, sections))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_h1_as_title() {
+        let (title, _) = parse("# My Doc\n\nBody text.\n").unwrap();
+        assert_eq!(title.as_deref(), Some("My Doc"));
+    }
+
+    #[test]
+    fn no_heading_yields_single_untitled_section() {
+        let (title, sections) = parse("just some plain body text\nwith two lines\n").unwrap();
+        assert_eq!(title, None);
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].heading.is_none());
+        assert!(sections[0].text.contains("plain body text"));
+    }
+
+    #[test]
+    fn splits_into_sections_at_each_heading() {
+        let raw = "# Title\n\nIntro para.\n\n## Section A\n\nA body.\n\n## Section B\n\nB body.\n";
+        let (title, sections) = parse(raw).unwrap();
+        assert_eq!(title.as_deref(), Some("Title"));
+        // Sections: [None(intro)? or Title heading, Section A, Section B]
+        let headings: Vec<Option<String>> = sections.iter().map(|s| s.heading.clone()).collect();
+        assert!(headings.iter().any(|h| h.as_deref() == Some("Section A")));
+        assert!(headings.iter().any(|h| h.as_deref() == Some("Section B")));
+        let a = sections.iter().find(|s| s.heading.as_deref() == Some("Section A")).unwrap();
+        assert!(a.text.contains("A body."));
+        let b = sections.iter().find(|s| s.heading.as_deref() == Some("Section B")).unwrap();
+        assert!(b.text.contains("B body."));
+    }
+
+    #[test]
+    fn empty_input_yields_one_empty_section() {
+        let (title, sections) = parse("").unwrap();
+        assert_eq!(title, None);
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].text.is_empty());
+    }
+}

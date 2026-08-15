@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
+use chrono::Utc;
 use mnemo::ids::MemoryId;
 use mnemo::models::{MemoryStatus, MemoryType};
-use mnemo::Mnemo;
+use mnemo::{Mnemo, MemoryProposal};
 
 use crate::{MemoryCommand, MemoryStatusArg, MemoryTypeArg};
 
@@ -37,6 +38,38 @@ pub async fn run(db: &Mnemo, cmd: MemoryCommand) -> anyhow::Result<()> {
             let id = MemoryId::from_str(&id).map_err(|e| anyhow::anyhow!("invalid memory id: {e}"))?;
             memories.delete(id).await?;
             println!("removed memory {id}");
+        }
+        MemoryCommand::Propose { content, r#type, confidence } => {
+            if content.is_empty() {
+                anyhow::bail!("no content given; usage: mnemo memory propose <content...> --confidence <0.0-1.0>");
+            }
+            match memories.propose(to_memory_type(r#type), content.join(" "), confidence).await? {
+                MemoryProposal::Saved(m) => println!("saved memory {} as active (confidence {:.2})", m.id, confidence),
+                MemoryProposal::Candidate(m) => {
+                    println!("saved memory {} as a candidate for review (confidence {:.2})", m.id, confidence)
+                }
+                MemoryProposal::Rejected => println!("rejected: confidence {confidence:.2} is below 0.50"),
+            }
+        }
+        MemoryCommand::Promote { min_importance } => {
+            let promoted = memories.promote_ready(min_importance).await?;
+            if promoted.is_empty() {
+                println!("no candidates cleared importance >= {min_importance:.2}");
+            } else {
+                for id in promoted {
+                    println!("promoted {id} to active");
+                }
+            }
+        }
+        MemoryCommand::ExpireTemporary => {
+            let expired = memories.expire_temporary(Utc::now()).await?;
+            if expired.is_empty() {
+                println!("no temporary memories have expired");
+            } else {
+                for id in expired {
+                    println!("expired {id}");
+                }
+            }
         }
     }
 

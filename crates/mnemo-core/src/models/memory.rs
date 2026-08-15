@@ -82,4 +82,33 @@ impl Memory {
     pub fn is_temporary_candidate(confidence: f32) -> bool {
         (0.50..0.85).contains(&confidence)
     }
+
+    /// Full decision per the plan.md section 22 policy table:
+    /// `>= 0.85` -> auto-save, `0.50-0.84` -> temporary candidate,
+    /// `< 0.50` -> do not save. Callers proposing sensitive
+    /// information should tighten these bounds themselves before
+    /// calling `decide` (section 22: "Sensitive information should
+    /// have stricter rules").
+    pub fn decide(confidence: f32) -> MemoryDecision {
+        if confidence >= 0.85 {
+            MemoryDecision::AutoSave
+        } else if confidence >= 0.50 {
+            MemoryDecision::Candidate
+        } else {
+            MemoryDecision::Reject
+        }
+    }
+}
+
+/// Outcome of applying the section 22 confidence policy to a proposed
+/// memory or profile update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryDecision {
+    /// Confidence >= 0.85: store immediately as [`MemoryStatus::Active`].
+    AutoSave,
+    /// Confidence 0.50-0.84: store as [`MemoryStatus::Candidate`] for
+    /// later review/promotion.
+    Candidate,
+    /// Confidence < 0.50: do not persist.
+    Reject,
 }

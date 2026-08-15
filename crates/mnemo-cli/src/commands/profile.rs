@@ -1,4 +1,4 @@
-use mnemo::Mnemo;
+use mnemo::{Mnemo, ProfileProposal};
 
 use crate::ProfileCommand;
 
@@ -27,6 +27,13 @@ pub async fn run(db: &Mnemo, cmd: ProfileCommand) -> anyhow::Result<()> {
             profile.remove(key.clone()).await?;
             println!("removed {key}");
         }
+        ProfileCommand::Propose { key, value, confidence } => match profile.propose(key.clone(), value, confidence).await? {
+            ProfileProposal::Saved => println!("set {key} (confidence {confidence:.2})"),
+            ProfileProposal::NeedsConfirmation => {
+                println!("confidence {confidence:.2} needs confirmation; not written. Use `memory propose` to record it as a review candidate instead.")
+            }
+            ProfileProposal::Rejected => println!("rejected: confidence {confidence:.2} is below 0.50"),
+        },
     }
 
     Ok(())

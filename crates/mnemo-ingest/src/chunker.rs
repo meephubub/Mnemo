@@ -130,3 +130,84 @@ fn split_paragraphs_with_offsets(text: &str) -> Vec<(&str, usize)> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsers::{FileKind, ParsedFile};
+
+    fn parsed_single_section(text: &str) -> ParsedFile {
+        ParsedFile {
+            kind: FileKind::Text,
+            title: None,
+            text: text.to_string(),
+            sections: vec![(None, text.to_string(), 0)],
+        }
+    }
+
+    #[test]
+    fn empty_text_produces_no_chunks() {
+        let parsed = parsed_single_section("");
+        let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn single_short_paragraph_is_one_chunk() {
+        let parsed = parsed_single_section("Just one short paragraph.");
+        let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].text, "Just one short paragraph.");
+        assert_eq!(drafts[0].start_offset, 0);
+    }
+
+    #[test]
+    fn paragraphs_are_packed_up_to_target_chars() {
+        // Three ~40-char paragraphs with a tiny target budget should
+        // produce more than one chunk, each within reach of the budget.
+        let text = format!("{}\n\n{}\n\n{}", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let parsed = parsed_single_section(&text);
+        let config = ChunkConfig {
+            target_chars: 50,
+            min_chars: 10,
+        };
+        let drafts = chunk_parsed_file(&parsed, &config);
+        assert!(drafts.len() >= 2, "expected multiple chunks, got {}", drafts.len());
+        for d in &drafts {
+            assert!(!d.text.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn tiny_trailing_paragraph_is_merged_into_previous_chunk() {
+        let text = format!("{}\n\nshort", "x".repeat(60));
+        let parsed = parsed_single_section(&text);
+        let config = ChunkConfig {
+            target_chars: 1000,
+            min_chars: 20,
+        };
+        let drafts = chunk_parsed_file(&parsed, &config);
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].text.ends_with("short"));
+    }
+
+    #[test]
+    fn blank_only_text_produces_no_chunks() {
+        let parsed = parsed_single_section("\n\n   \n\n");
+        let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn section_heading_is_carried_onto_chunks() {
+        let parsed = ParsedFile {
+            kind: FileKind::Markdown,
+            title: None,
+            text: "Some body text.".to_string(),
+            sections: vec![(Some("Intro".to_string()), "Some body text.".to_string(), 0)],
+        };
+        let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].section.as_deref(), Some("Intro"));
+    }
+}
