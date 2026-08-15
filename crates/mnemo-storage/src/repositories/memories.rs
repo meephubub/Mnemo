@@ -77,6 +77,14 @@ pub fn list(conn: &Connection, status: Option<MemoryStatus>) -> Result<Vec<Memor
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+pub fn update_content(conn: &Connection, id: MemoryId, content: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET content = ?1 WHERE id = ?2",
+        params![content, id.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn set_status(conn: &Connection, id: MemoryId, status: MemoryStatus) -> Result<()> {
     conn.execute(
         "UPDATE memories SET status = ?1 WHERE id = ?2",
