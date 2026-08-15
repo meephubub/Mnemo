@@ -100,3 +100,16 @@ pub fn list_messages(conn: &Connection, conversation_id: ConversationId) -> Resu
     let rows = stmt.query_map(params![conversation_id.to_string()], message_from_row)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
+
+/// Fetch a single message by id (used by `mnemo-search`'s vector
+/// search to hydrate a hit after the embeddings candidate pool has
+/// already selected which message ids to return).
+pub fn get_message(conn: &Connection, id: MessageId) -> Result<Message> {
+    conn.query_row(
+        "SELECT * FROM messages WHERE id = ?1",
+        params![id.to_string()],
+        message_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| StorageError::NotFound(format!("message {id}")))
+}

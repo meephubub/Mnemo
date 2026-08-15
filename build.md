@@ -32,10 +32,10 @@ Cargo.toml                 # workspace root + the `mnemo` facade package (src/li
 src/                        # the `mnemo` facade crate
 crates/
   mnemo-core/                # data model, IDs, error type (no I/O)
-  mnemo-storage/              # SQLite schema, migrations, repositories (incl. embeddings), FTS5
+  mnemo-storage/              # SQLite schema, migrations, repositories (incl. chunk + message embeddings), FTS5
   mnemo-ingest/                # txt/md/html parsing + chunking (pure, no I/O beyond reading files)
   mnemo-embeddings/             # Embedder trait + default HashingEmbedder (Phase 4)
-  mnemo-search/                  # lexical (BM25), vector (cosine), hybrid fusion retrieval
+  mnemo-search/                  # lexical (BM25), vector (cosine), hybrid fusion, reranking, context packing
   mnemo-cli/                      # `mnemo` binary — not covered by this file; see ROADMAP.md scope note
 ```
 
@@ -143,18 +143,47 @@ let hybrid_hits = db
 // Context packing (Phase 7): fuse + dedupe + greedily pack into a
 // token budget, capped at a number of distinct sources, with full
 // `Source` records attached for citation rendering.
-let packed = db.context_with(embedder).pack("project deadline", 2000).await?;
+let packed = db.context_with(embedder.clone()).pack("project deadline", 2000).await?;
 for chunk in &packed.chunks {
     println!("[{} tok] {}", chunk.estimated_tokens, chunk.hit.text);
 }
 println!("used {} tokens across {} sources", packed.estimated_tokens, packed.sources.len());
+
+// Reranking (Phase 6): an optional Stage 2 over the fused candidate
+// pool, run by `pack_context` before dedup/packing when a `reranker`
+// is set. `mnemo::HeuristicReranker` is the default, dependency-free
+// implementation (blends the Stage 1 score with query/body exact-
+// phrase overlap and a title/section match boost); anything
+// implementing `mnemo::Reranker` can be swapped in instead (e.g. a
+// real cross-encoder model).
+let reranker = std::sync::Arc::new(mnemo::HeuristicReranker::default());
+let reranked_packed = db
+    .context_with(embedder.clone())
+    .pack_with_reranker("project deadline", 2000, reranker)
+    .await?;
+
+// Neighbor-chunk expansion (Phase 7 follow-up): after the main pack,
+// pull in each selected chunk's immediate previous/next sibling from
+// the same document when the token budget allows, so packed context
+// isn't cut off mid-sentence at either edge.
+let expanded_packed = db
+    .context_with(embedder)
+    .pack_with_neighbor_expansion("project deadline", 2000)
+    .await?;
 ```
 
 `db.context()` (no embedder argument) uses the same default
 `HashingEmbedder` as `db.embed()`; use `db.context_with(embedder)` to
 reuse a real model's embedder instance so query and stored vectors
-are comparable. Reranking (Phase 6) is not implemented yet — see
-`ROADMAP.md`'s "Not started" / "Suggested next steps" sections.
+are comparable. Reranking and neighbor-chunk expansion are both
+opt-in per request — via `ContextHandle::pack_with_reranker` /
+`pack_with_neighbor_expansion`, or `ContextRequest::with_reranker` /
+`with_neighbor_expansion` (or the `ContextRequest.reranker` /
+`.neighbor_expansion` fields directly when building a
+`pack_with_request` call that also needs other custom options, e.g. a
+non-default `token_budget`/`max_sources`/`scope`). `pack`/
+`pack_with_request` without either set behave exactly as before
+Phase 6/the neighbor-expansion follow-up.
 
 ## Checks
 
@@ -165,14 +194,18 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-No tests have been written yet for `mnemo-storage` or `mnemo-ingest`
-repositories (see `ROADMAP.md`), but `mnemo-embeddings` and
-`mnemo-search` (lexical/vector/hybrid search plus context packing)
-both include unit tests — `cargo test` will run those.
+No dedicated tests have been written yet for `mnemo-storage` or
+`mnemo-ingest` (see `ROADMAP.md`) — `mnemo-storage`'s new
+`chunks::get_by_document_and_index` (added to support neighbor-chunk
+expansion) is exercised only indirectly, via `mnemo-search`'s
+neighbor-expansion tests, not a `mnemo-storage`-local test. But
+`mnemo-embeddings` and `mnemo-search` (lexical/vector/hybrid search,
+reranking, and context packing, including neighbor expansion) both
+include unit tests — `cargo test` will run those.
 
 To verify just the Phase 4 (embeddings)/Phase 5 (hybrid retrieval)/
-Phase 7 (context packing) work without running the whole workspace
-suite:
+Phase 6 (reranking)/Phase 7 (context packing) work without running the
+whole workspace suite:
 
 ```sh
 cargo check -p mnemo-storage -p mnemo-embeddings -p mnemo-search -p mnemo

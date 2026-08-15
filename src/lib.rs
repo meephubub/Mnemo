@@ -36,6 +36,7 @@ pub use ingest::{IngestHandle, IngestOutcome};
 pub use memory::{MemoryProposal, MemoryStore};
 pub use profile::{ProfileHandle, ProfileProposal};
 pub use search::{HitKind, HybridWeights, SearchHandle, SearchHit, SearchOptions, SearchScope};
+pub use mnemo_search::{rerank, HeuristicReranker, Reranker};
 
 pub use mnemo_core::{ids, models, MnemoError, Result};
 pub use mnemo_embeddings::{Embedder, HashingEmbedder};

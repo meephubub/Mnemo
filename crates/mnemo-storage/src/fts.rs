@@ -6,7 +6,7 @@
 //! full model so callers (e.g. `mnemo-search`) can fuse it with other
 //! signals without re-querying.
 
-use mnemo_core::ids::{ChunkId, DocumentId};
+use mnemo_core::ids::{ChunkId, DocumentId, MessageId};
 use mnemo_core::models::{Chunk, Message};
 use rusqlite::{params, Connection, Row};
 
@@ -98,4 +98,10 @@ pub fn search_messages(conn: &Connection, query: &str, limit: usize) -> Result<V
 /// pool has already selected which ids to hydrate).
 pub fn get_chunk(conn: &Connection, id: ChunkId) -> Result<Chunk> {
     crate::repositories::chunks::get(conn, id)
+}
+
+/// Fetch a single message by id (helper used after a vector/hybrid
+/// candidate pool has already selected which ids to hydrate).
+pub fn get_message(conn: &Connection, id: MessageId) -> Result<Message> {
+    crate::repositories::conversations::get_message(conn, id)
 }

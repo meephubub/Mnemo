@@ -62,41 +62,124 @@ library.
   `HybridWeights { lexical_weight, vector_weight }`), exposed on the
   facade as `SearchHandle::search_vector` / `search_hybrid`. Unit
   tests in `crates/mnemo-search/src/lib.rs` cover lexical, vector, and
-  hybrid search against an in-memory db. **Not done:** entity/recency/
+  hybrid search against an in-memory db. As of this pass, conversation
+  messages are embedded and retrievable the same way document chunks
+  are (previously only chunks were embedded, so vector/hybrid fusion
+  only ever affected document hits — see the `Not done` note this
+  replaces): a new `message_embeddings` table + `MessageEmbedding`
+  model (mirrors `embeddings`/`Embedding` exactly, keyed on
+  `message_id` instead of `chunk_id` — schema version bumped 2 → 3),
+  `mnemo_storage::repositories::message_embeddings` (`upsert`, `get`,
+  `list_by_model`, `list_pending_message_ids`, `count`,
+  `count_pending`, `clear`), and `EmbedHandle::embed_pending_messages`
+  / `count_messages` / `count_pending_messages` / `clear_messages` /
+  `get_message` alongside the existing chunk-only methods.
+  `vector_search` now scans both `embeddings` and `message_embeddings`
+  and merges the two candidate pools by cosine score before
+  truncating to `limit`; `hybrid_search` fuses lexical and vector hits
+  by a `(kind, id)` identity (previously `ChunkId`-only, so a
+  `hybrid_search` call for `SearchScope::Conversations` fused lexical
+  message hits with *no* vector signal at all) and now filters
+  `vector_search`'s output by `SearchOptions::scope` before fusing
+  (`vector_search` itself has no scope parameter — every call scans
+  every stored vector for the model, same as before). New tests in
+  `crates/mnemo-search/src/lib.rs`
+  (`vector_search_ranks_semantically_closer_message_first`,
+  `hybrid_search_fuses_message_vector_hit_with_lexical_hit`,
+  `hybrid_search_documents_scope_excludes_message_vector_hits`) cover
+  message vector ranking, hybrid fusion including a message hit, and
+  scope filtering excluding message vector hits from a
+  `Documents`-scoped hybrid search. **Not done:** entity/recency/
   importance signals in the fusion score (plan.md section 8 lists
-  these as later additions), embedding of conversation messages (only
-  chunks are embedded today, so hybrid fusion only affects document
-  hits), retrieval benchmarks.
+  these as later additions), retrieval benchmarks, an automatic
+  "embed new messages as they're added" hook (`embed_pending_messages`
+  must still be called explicitly, same as `embed_pending` for
+  chunks).
+- **Phase 6 — Reranking.** `mnemo_search::rerank` module (previously
+  written but not wired into anything — not declared in
+  `mnemo-search`'s `lib.rs`, so it was unreachable from outside the
+  crate) is now a real module: a `Reranker` trait (`score(query, hits)
+  -> Vec<f64>`, one score per hit) and a `rerank()` function that
+  re-scores and re-sorts a candidate pool, plus `HeuristicReranker` —
+  a dependency-free default that blends the incoming Stage 1 score
+  with query/body exact-phrase token overlap and a title/section
+  match boost. Wired into `pack_context` as a genuinely optional Stage
+  2: `ContextRequest` gained a `reranker: Option<Arc<dyn Reranker>>`
+  field (`None` by default, so existing callers are unaffected) and a
+  `with_reranker()` builder method; when set, `pack_context` runs it
+  over the fused `hybrid_search` candidate pool *before*
+  dedup/packing, so the reranker's scores (not just Stage 1's fused
+  scores) decide what survives near-duplicate dropping and greedy
+  packing. Exposed on the facade as `Reranker`/`HeuristicReranker`/
+  `rerank` re-exports plus `ContextHandle::pack_with_reranker`. Unit
+  tests in `crates/mnemo-search/src/rerank.rs` (reordering, title-match
+  boosting, empty-input no-op, mismatched-score-count error) and two
+  new tests in `crates/mnemo-search/src/context.rs`
+  (`pack_context_applies_configured_reranker`,
+  `pack_context_without_reranker_skips_stage_two`) covering both the
+  `Some`/`None` branches through `pack_context` itself. **Not
+  wired:** `hybrid_search` itself still returns fused results
+  directly — reranking is only available as `pack_context`'s Stage 2,
+  matching plan.md's "the reranker should be optional" framing; a
+  caller who wants ranked hits (not a packed context) with reranking
+  applied would need to call `mnemo_search::rerank::rerank` directly
+  against a `hybrid_search` pool themselves. Still dependency-free
+  (`HeuristicReranker`) — no learned cross-encoder model integration
+  (BGE/Jina/ONNX), which the `Reranker` trait leaves room for but does
+  not implement.
 - **Phase 7 — Context Packing.** `mnemo_search::context::pack_context`
-  runs `hybrid_search` for a candidate pool, drops near-duplicate
-  chunks (word-set Jaccard similarity ≥ 0.85), then greedily packs the
-  rest into a `token_budget` (≈4 chars/token estimate) while capping
-  distinct sources at `max_sources` — exposed on the facade as
-  `Mnemo::context()` / `Mnemo::context_with(embedder)` →
-  `ContextHandle::pack` / `pack_with_request`. `PackedContext` carries
-  `chunks: Vec<ContextChunk>` (each with its `SearchHit` and estimated
-  token count), `estimated_tokens`, and the fully-hydrated `sources:
+  runs `hybrid_search` for a candidate pool, optionally reranks it
+  (Phase 6, see above), drops near-duplicate chunks (word-set Jaccard
+  similarity ≥ 0.85), then greedily packs the rest into a
+  `token_budget` (≈4 chars/token estimate) while capping distinct
+  sources at `max_sources`, and (as of this pass) optionally expands
+  each selected chunk with its immediate document neighbors — exposed
+  on the facade as `Mnemo::context()` / `Mnemo::context_with(embedder)`
+  → `ContextHandle::pack` / `pack_with_request` / `pack_with_reranker`
+  / `pack_with_neighbor_expansion`. `PackedContext` carries `chunks:
+  Vec<ContextChunk>` (each with its `SearchHit` and estimated token
+  count), `estimated_tokens`, and the fully-hydrated `sources:
   Vec<Source>` used, for citation rendering. `SearchHit` gained a
   `source_id` field (previously only `source_name: Option<String>`)
   so packing/diversity selection and source hydration have a stable
   key instead of matching on a display name. Unit tests in
-  `crates/mnemo-search/src/context.rs` cover token-budget
-  enforcement, source-diversity capping, and near-duplicate dropping.
-  **Not done:** "preserve surrounding context where needed" (plan.md's
-  neighbor-chunk expansion — e.g. pulling in `chunk_index - 1`/`+ 1`
-  for a selected chunk), true optimal packing (this is greedy-by-score,
-  not a knapsack solve — see the doc comment on `pack_context` for why
-  that's an intentional tradeoff), reranking before packing (Phase 6).
+  `crates/mnemo-search/src/context.rs` cover token-budget enforcement,
+  source-diversity capping, near-duplicate dropping, reranker wiring,
+  and (as of this pass) neighbor expansion.
+  - **"Preserve surrounding context where needed" (neighbor-chunk
+    expansion)** is now implemented as an opt-in post-pack step:
+    `ContextRequest` gained a `neighbor_expansion: bool` field
+    (`false` by default) and a `with_neighbor_expansion()` builder;
+    when set, `pack_context` runs a new `expand_with_neighbors` pass
+    after the main greedy pack (deliberately *after*, not folded in —
+    see that function's doc comment for why) that looks up each
+    selected document chunk's `chunk_index - 1` / `+ 1` siblings via
+    a new `mnemo_storage::repositories::chunks::get_by_document_and_index`
+    and pulls in whichever ones still fit the remaining
+    `token_budget`. Neighbors inherit their parent's provenance
+    (`document_title`/`source_id`/`source_name`/`score`) but keep
+    their own `section`/`page`. Three new tests
+    (`pack_context_expands_neighbor_chunks_when_enabled`,
+    `pack_context_neighbor_expansion_respects_token_budget`,
+    `pack_context_neighbor_expansion_disabled_by_default`) cover
+    enabling it, its budget interaction, and the disabled-by-default
+    regression case, using a new `seed_single_document` test helper
+    (chunks sharing one document, unlike `seed_multi_source`'s
+    one-document-per-chunk).
+  - **Not done:** true optimal packing (this is greedy-by-score, not
+    a knapsack solve — see the doc comment on `pack_context` for why
+    that's an intentional tradeoff).
 
 ## Not started
 
-- **Phase 6 — Reranking.** No `Reranker` trait or two-stage pipeline;
-  `hybrid_search` (and therefore `pack_context`, which builds on it)
-  returns fused results directly as the final ranking.
-- **Phase 8 — Conversation Memory.** Conversations/messages are
-  stored and searchable, but there's no summarization or
-  memory-extraction pipeline over them, and messages aren't embedded
-  (so vector/hybrid search only covers document chunks today).
+- **Phase 8 — Conversation Memory (partial).** Conversations/messages
+  are stored, searchable, and (as of this pass) embedded/retrievable
+  via vector and hybrid search alongside document chunks — see Phase
+  5 above. **Not done:** there's still no summarization or
+  memory-extraction pipeline over conversation history (turning
+  messages into `Memory`/`ProfileEntry` records), which is what this
+  phase is really about; embedding coverage was only ever the
+  retrieval-side prerequisite for it.
 - **Phase 9 — User Profile (partial).** Storage + CRUD exist
   (`Mnemo::profile()`), but there's no automatic extraction/update
   pipeline applying the confidence-threshold rules from plan.md
@@ -139,27 +222,36 @@ library.
 
 ## Suggested next steps
 
-1. Phase 6: implement a `Reranker` trait and wire it into
-   `pack_context` (and/or `hybrid_search`) as an optional second stage
-   over the fused candidate pool, before packing (plan.md section 10
-   / section 82). (already partially implemented see rerank.rs in the mnemo-search crate)
-2. Phase 7 follow-up: neighbor-chunk expansion ("preserve surrounding
-   context where needed") — when a chunk is selected, optionally pull
-   in `chunk_index - 1` / `chunk_index + 1` from the same document if
-   the token budget allows, so packed context isn't mid-sentence at
-   its edges.
-3. Add `cargo test` coverage for `mnemo-storage` repositories and
-   `mnemo-ingest` chunking/parsing (still untested; only
-   `mnemo-embeddings` and `mnemo-search` have unit tests).
-4. Phase 2: add PDF/DOCX parsers behind the existing `FileKind`
+1. Add `cargo test` coverage for the rest of `mnemo-storage`
+   repositories and `mnemo-ingest` chunking/parsing (still mostly
+   untested; only `mnemo-embeddings` and `mnemo-search` — plus, as of
+   this pass, `chunks::get_by_document_and_index` via
+   `mnemo-search`'s neighbor-expansion tests — have coverage).
+2. Phase 2: add PDF/DOCX parsers behind the existing `FileKind`
    enum in `mnemo-ingest`.
-5. Phase 8: embed conversation messages the same way chunks are
-   embedded today, so `vector_search`/`hybrid_search`/`pack_context`
-   can cover conversation history, not just documents.
-6. Phase 10: implement the promotion/decay policy described in
+3. Phase 8: build a summarization/memory-extraction pipeline over
+   conversation history (turning messages into `Memory`/
+   `ProfileEntry` records via the confidence-threshold rules in
+   plan.md section 22) — the retrieval-side prerequisite (embedding
+   messages so `vector_search`/`hybrid_search` cover conversation
+   history, not just documents) is now done; `pack_context` still
+   only pulls from `hybrid_search`'s candidate pool, so it already
+   picks up message hits for free once a caller requests
+   `SearchScope::All`/`Conversations`.
+4. Phase 10: implement the promotion/decay policy described in
    plan.md sections 24-26 as a function callers can run periodically
    (building on the existing `MemoryStore::promote_ready`/
    `expire_temporary`).
-7. Phase 4 follow-up: replace `HashingEmbedder` with a real local
+5. Phase 4 follow-up: replace `HashingEmbedder` with a real local
    embedding model (ONNX/Candle) behind the existing `Embedder` trait,
    and add an ANN index for sub-linear vector search at scale.
+6. Phase 6 follow-up: a learned cross-encoder `Reranker` implementation
+   (BGE/Jina/other ONNX model) as an alternative to `HeuristicReranker`,
+   and/or exposing reranking directly on `hybrid_search`'s result (not
+   just `pack_context`'s Stage 2) for callers that want ranked hits
+   without packing them into a context.
+7. Phase 7 follow-up: `expand_with_neighbors` only pulls in the
+   immediate `± 1` sibling today; a `neighbor_radius` option (or
+   similar) could let callers ask for more than one chunk of
+   surrounding context on either side, still gated by the token
+   budget.

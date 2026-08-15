@@ -12,3 +12,8 @@ mnemo-core = { workspace = true }
 mnemo-storage = { workspace = true }
 mnemo-embeddings = { workspace = true }
 thiserror = { workspace = true }
+# Needed directly (not just transitively via mnemo-storage) so
+# `context.rs`'s neighbor-chunk expansion can name `rusqlite::Connection`
+# in its own function signatures, matching the `&Connection` type
+# `Db::conn()` derefs to.
+rusqlite = { workspace = true }

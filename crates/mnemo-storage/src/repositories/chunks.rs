@@ -61,6 +61,22 @@ pub fn list_for_document(conn: &Connection, document_id: DocumentId) -> Result<V
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Look up a single chunk by its document and ordinal position,
+/// returning `Ok(None)` (rather than a `NotFound` error) when there is
+/// no chunk at that index — e.g. `chunk_index == 0`'s "previous"
+/// neighbor, or the last chunk's "next" neighbor. Used by
+/// `mnemo-search`'s context packing for neighbor-chunk expansion
+/// (plan.md's "preserve surrounding context where needed").
+pub fn get_by_document_and_index(conn: &Connection, document_id: DocumentId, chunk_index: usize) -> Result<Option<Chunk>> {
+    Ok(conn
+        .query_row(
+            "SELECT * FROM chunks WHERE document_id = ?1 AND chunk_index = ?2",
+            params![document_id.to_string(), chunk_index as i64],
+            from_row,
+        )
+        .optional()?)
+}
+
 pub fn delete_for_document(conn: &Connection, document_id: DocumentId) -> Result<()> {
     conn.execute(
         "DELETE FROM chunks WHERE document_id = ?1",

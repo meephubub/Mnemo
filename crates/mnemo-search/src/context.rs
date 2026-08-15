@@ -16,21 +16,40 @@
 //! - Preserve citations (`ContextChunk` carries the full `SearchHit`,
 //!   which already has document/source/section/page provenance).
 //!
-//! **Not implemented yet:** "preserve surrounding context where
-//! needed" (plan.md's neighbor-chunk expansion) — see ROADMAP.md.
+//! Reranking (plan.md section 10 / Phase 6) plugs in as an optional
+//! second stage: when [`ContextRequest::reranker`] is set,
+//! [`pack_context`] runs it over the fused `hybrid_search` candidate
+//! pool — before dedup/packing, so the reranker's scores (not just
+//! Stage 1's fused scores) drive which chunks survive near-duplicate
+//! dropping and greedy packing.
+//!
+//! "Preserve surrounding context where needed" (plan.md's
+//! neighbor-chunk expansion) is implemented as an opt-in post-pack
+//! step: when [`ContextRequest::neighbor_expansion`] is set, for each
+//! selected chunk [`pack_context`] looks up its immediate
+//! `chunk_index - 1` / `chunk_index + 1` siblings in the same
+//! document and pulls in whichever ones still fit the remaining
+//! token budget, so a chunk that got cut off mid-sentence at either
+//! edge has its neighbor available too. See [`expand_with_neighbors`]
+//! for why this runs *after* the main greedy pack rather than being
+//! folded into it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use mnemo_core::ids::ChunkId;
 use mnemo_core::models::Source;
-use mnemo_storage::repositories::sources;
+use mnemo_storage::repositories::{chunks, sources};
 use mnemo_storage::Db;
 use mnemo_embeddings::Embedder;
+use rusqlite::Connection;
 
 use crate::error::Result;
-use crate::{hybrid_search, HybridWeights, SearchHit, SearchOptions, SearchScope};
+use crate::rerank::Reranker;
+use crate::{hybrid_search, HitKind, HybridWeights, SearchHit, SearchOptions, SearchScope};
 
 /// Input to [`pack_context`] (plan.md section 11's `ContextRequest`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContextRequest {
     pub query: String,
     pub token_budget: usize,
@@ -47,6 +66,20 @@ pub struct ContextRequest {
     /// `Default`), matching plan.md section 10's "~50 candidates"
     /// Stage 1 output size.
     pub candidate_pool: usize,
+    /// Optional Stage 2 reranker (plan.md section 10 / Phase 6),
+    /// applied to the fused `hybrid_search` candidate pool before
+    /// dedup/packing. `None` (the default) skips reranking entirely,
+    /// so `pack_context` behaves exactly as it did before Phase 6 —
+    /// per plan.md, "the reranker should be optional".
+    pub reranker: Option<Arc<dyn Reranker>>,
+    /// When `true`, after the main pack each selected document chunk
+    /// gets its immediate previous/next chunk (by `chunk_index`) from
+    /// the same document pulled in too, budget permitting — plan.md's
+    /// "preserve surrounding context where needed". Defaults to
+    /// `false`: an opt-in step, since it trades some of the token
+    /// budget that would otherwise go to more independently-ranked
+    /// chunks for continuity around the chunks already selected.
+    pub neighbor_expansion: bool,
 }
 
 impl Default for ContextRequest {
@@ -58,7 +91,27 @@ impl Default for ContextRequest {
             weights: HybridWeights::default(),
             scope: SearchScope::All,
             candidate_pool: 50,
+            reranker: None,
+            neighbor_expansion: false,
         }
+    }
+}
+
+impl std::fmt::Debug for ContextRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextRequest")
+            .field("query", &self.query)
+            .field("token_budget", &self.token_budget)
+            .field("max_sources", &self.max_sources)
+            .field("weights", &self.weights)
+            .field("scope", &self.scope)
+            .field("candidate_pool", &self.candidate_pool)
+            .field(
+                "reranker",
+                &self.reranker.as_ref().map(|r| r.name()),
+            )
+            .field("neighbor_expansion", &self.neighbor_expansion)
+            .finish()
     }
 }
 
@@ -69,6 +122,23 @@ impl ContextRequest {
             token_budget,
             ..Default::default()
         }
+    }
+
+    /// Set a Stage 2 reranker to run over the candidate pool before
+    /// dedup/packing (plan.md section 10 / Phase 6). Builder-style
+    /// convenience over setting [`Self::reranker`] directly.
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    /// Enable neighbor-chunk expansion: after the main pack, pull in
+    /// each selected chunk's immediate document siblings when they
+    /// fit the remaining token budget. Builder-style convenience over
+    /// setting [`Self::neighbor_expansion`] directly.
+    pub fn with_neighbor_expansion(mut self, enabled: bool) -> Self {
+        self.neighbor_expansion = enabled;
+        self
     }
 }
 
@@ -146,6 +216,16 @@ pub fn pack_context(db: &Db, embedder: &dyn Embedder, request: &ContextRequest) 
     };
     let candidates = hybrid_search(db, embedder, &request.query, &search_options, request.weights)?;
 
+    // Stage 2 (plan.md section 10 / Phase 6): optionally rerank the
+    // fused candidate pool before dedup/packing, so a reranker's
+    // scores — not just Stage 1's fused scores — drive what survives
+    // near-duplicate dropping and greedy packing below. Skipped
+    // entirely when no reranker is configured.
+    let candidates = match &request.reranker {
+        Some(reranker) => crate::rerank::rerank(reranker.as_ref(), &request.query, candidates)?,
+        None => candidates,
+    };
+
     // Deduplicate: drop any candidate whose text is a near-duplicate
     // of an already-kept, higher-ranked candidate.
     let mut kept: Vec<SearchHit> = Vec::new();
@@ -187,9 +267,20 @@ pub fn pack_context(db: &Db, embedder: &dyn Embedder, request: &ContextRequest) 
         });
     }
 
+    let conn = db.conn();
+
+    // Neighbor-chunk expansion (plan.md's "preserve surrounding
+    // context where needed"): opt-in post-pack step, see
+    // `expand_with_neighbors` for why it runs after rather than
+    // during the main greedy pack.
+    let packed = if request.neighbor_expansion {
+        expand_with_neighbors(&conn, packed, &mut tokens_used, request.token_budget)?
+    } else {
+        packed
+    };
+
     // Hydrate full `Source` records for citation rendering, in
     // first-selected order.
-    let conn = db.conn();
     let mut source_cache: HashMap<mnemo_core::ids::SourceId, Source> = HashMap::new();
     let mut ordered_sources = Vec::new();
     for chunk in &packed {
@@ -208,6 +299,129 @@ pub fn pack_context(db: &Db, embedder: &dyn Embedder, request: &ContextRequest) 
         chunks: packed,
         sources: ordered_sources,
     })
+}
+
+/// Post-pack step for [`ContextRequest::neighbor_expansion`]: for
+/// each already-selected document chunk, try to pull in its
+/// immediate `chunk_index - 1` / `chunk_index + 1` siblings from the
+/// same document.
+///
+/// This runs as a separate pass *after* the main greedy pack rather
+/// than being folded into it, because neighbor lookups key off a
+/// chunk's `document_id`/`chunk_index` — fields that live on the
+/// stored [`mnemo_core::models::Chunk`], not on [`SearchHit`] — so
+/// they can only be resolved for chunks the main pack already
+/// decided to select (`hybrid_search`'s candidate pool has no
+/// business paying for that lookup on every candidate, most of which
+/// won't make the cut). It also keeps `neighbor_expansion` purely
+/// additive: budget/diversity decisions made by the main pack are
+/// never revisited, only supplemented.
+///
+/// Neighbors inherit their parent's provenance (`document_title`,
+/// `source_id`, `source_name`) — they're always in the same document
+/// as the chunk they're expanding — but their own `section`/`page`,
+/// since either can legitimately differ from the parent's within a
+/// document. They also inherit the parent's `score` rather than
+/// getting one of their own: they were never independently ranked,
+/// only pulled in for continuity around a chunk that was.
+fn expand_with_neighbors(
+    conn: &Connection,
+    packed: Vec<ContextChunk>,
+    tokens_used: &mut usize,
+    token_budget: usize,
+) -> Result<Vec<ContextChunk>> {
+    let mut included: HashSet<ChunkId> = packed.iter().filter_map(|c| c.hit.chunk_id).collect();
+    let mut expanded: Vec<ContextChunk> = Vec::with_capacity(packed.len());
+
+    for chunk in packed {
+        // Only document chunks have a `chunk_index`/`document_id` to
+        // look up siblings for; conversation message hits pass
+        // through untouched.
+        let Some(chunk_id) = (chunk.hit.kind == HitKind::Chunk).then(|| chunk.hit.chunk_id).flatten() else {
+            expanded.push(chunk);
+            continue;
+        };
+        let Ok(record) = chunks::get(conn, chunk_id) else {
+            // The chunk backing this hit vanished between search and
+            // packing (e.g. concurrent deletion) — keep the hit as
+            // selected, just skip expanding it.
+            expanded.push(chunk);
+            continue;
+        };
+
+        let prev = match record.chunk_index.checked_sub(1) {
+            Some(prev_index) => {
+                try_add_neighbor(conn, &chunk.hit, record.document_id, prev_index, &mut included, tokens_used, token_budget)?
+            }
+            None => None,
+        };
+        let next = try_add_neighbor(
+            conn,
+            &chunk.hit,
+            record.document_id,
+            record.chunk_index + 1,
+            &mut included,
+            tokens_used,
+            token_budget,
+        )?;
+
+        if let Some(prev) = prev {
+            expanded.push(prev);
+        }
+        expanded.push(chunk);
+        if let Some(next) = next {
+            expanded.push(next);
+        }
+    }
+
+    Ok(expanded)
+}
+
+/// Look up the chunk at `neighbor_index` in `document_id` and, if it
+/// exists, isn't already included, and fits the remaining
+/// `token_budget`, build a [`ContextChunk`] for it and reserve its
+/// tokens against `tokens_used`. Returns `Ok(None)` for any reason
+/// the neighbor can't be added — that's the normal, expected outcome
+/// at either edge of a document or once the budget is exhausted, not
+/// an error condition.
+fn try_add_neighbor(
+    conn: &Connection,
+    parent_hit: &SearchHit,
+    document_id: mnemo_core::ids::DocumentId,
+    neighbor_index: usize,
+    included: &mut HashSet<ChunkId>,
+    tokens_used: &mut usize,
+    token_budget: usize,
+) -> Result<Option<ContextChunk>> {
+    let Some(neighbor) = chunks::get_by_document_and_index(conn, document_id, neighbor_index)? else {
+        return Ok(None);
+    };
+    if included.contains(&neighbor.id) {
+        return Ok(None);
+    }
+    let tokens = estimate_tokens(&neighbor.text);
+    if *tokens_used + tokens > token_budget {
+        return Ok(None);
+    }
+
+    included.insert(neighbor.id);
+    *tokens_used += tokens;
+    Ok(Some(ContextChunk {
+        hit: SearchHit {
+            kind: HitKind::Chunk,
+            text: neighbor.text,
+            score: parent_hit.score,
+            chunk_id: Some(neighbor.id),
+            message_id: None,
+            conversation_id: None,
+            document_title: parent_hit.document_title.clone(),
+            source_name: parent_hit.source_name.clone(),
+            source_id: parent_hit.source_id,
+            section: neighbor.section,
+            page: neighbor.page,
+        },
+        estimated_tokens: tokens,
+    }))
 }
 
 #[cfg(test)]
@@ -230,6 +444,32 @@ mod tests {
             let document = Document::new(source.id, "text/plain", format!("hash-{i}"), "v1");
             documents::insert(&conn, &document).unwrap();
             let chunk = Chunk::new(document.id, *text, 0);
+            chunks::insert(&conn, &chunk).unwrap();
+            let vector = embedder.embed(text).unwrap();
+            let embedding = Embedding::new(chunk.id, embedder.model_name(), embedder.model_version(), vector);
+            embeddings::upsert(&conn, &embedding).unwrap();
+        }
+
+        drop(conn);
+        db
+    }
+
+    /// Seed a single source/document made up of `chunk_texts` in
+    /// order (`chunk_index` 0, 1, 2, ...), each embedded with
+    /// `embedder`. Unlike `seed_multi_source`, every chunk shares one
+    /// document — what neighbor-chunk expansion needs to find
+    /// `chunk_index - 1` / `chunk_index + 1` siblings for.
+    fn seed_single_document(chunk_texts: &[&str], embedder: &dyn Embedder) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let source = Source::new(SourceType::File, "doc.txt");
+        sources::insert(&conn, &source).unwrap();
+        let document = Document::new(source.id, "text/plain", "hash", "v1");
+        documents::insert(&conn, &document).unwrap();
+
+        for (i, text) in chunk_texts.iter().enumerate() {
+            let chunk = Chunk::new(document.id, *text, i);
             chunks::insert(&conn, &chunk).unwrap();
             let vector = embedder.embed(text).unwrap();
             let embedding = Embedding::new(chunk.id, embedder.model_name(), embedder.model_version(), vector);
@@ -309,6 +549,162 @@ mod tests {
             token_budget: 10_000,
             ..Default::default()
         };
+        let packed = pack_context(&db, &embedder, &request).unwrap();
+        assert_eq!(packed.chunks.len(), 1);
+    }
+
+    /// A reranker that ignores every signal on `SearchHit` and scores
+    /// purely by document title, so this test doesn't depend on how
+    /// `hybrid_search`'s fused scores (or `HeuristicReranker`'s
+    /// min-max normalization of just two of them, which always maps
+    /// to the extremes `0.0`/`1.0`) happen to order the two seeded
+    /// chunks — only on whether `pack_context` actually invoked the
+    /// configured reranker at all.
+    struct TitleOnlyReranker;
+    impl Reranker for TitleOnlyReranker {
+        fn name(&self) -> &str {
+            "title-only"
+        }
+        fn score(&self, _query: &str, hits: &[SearchHit]) -> Result<Vec<f64>> {
+            Ok(hits
+                .iter()
+                .map(|h| if h.document_title.as_deref() == Some("Rust Programming Guide") { 1.0 } else { 0.0 })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn pack_context_applies_configured_reranker() {
+        let embedder = HashingEmbedder::default_dim();
+        // Two otherwise-equivalent chunks in different documents;
+        // `TitleOnlyReranker` always ranks the "Rust Programming
+        // Guide" one first, so seeing it first in `packed.chunks`
+        // proves `pack_context` actually ran Stage 2 reranking.
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn();
+        let titled_source = Source::new(SourceType::File, "rust-guide.txt");
+        sources::insert(&conn, &titled_source).unwrap();
+        let mut titled_doc = Document::new(titled_source.id, "text/plain", "hash-0", "v1");
+        titled_doc.title = Some("Rust Programming Guide".to_string());
+        documents::insert(&conn, &titled_doc).unwrap();
+        let titled_chunk = Chunk::new(titled_doc.id, "some unrelated body text here", 0);
+        chunks::insert(&conn, &titled_chunk).unwrap();
+        let titled_vector = embedder.embed("some unrelated body text here").unwrap();
+        embeddings::upsert(
+            &conn,
+            &Embedding::new(titled_chunk.id, embedder.model_name(), embedder.model_version(), titled_vector),
+        )
+        .unwrap();
+
+        let plain_source = Source::new(SourceType::File, "cooking.txt");
+        sources::insert(&conn, &plain_source).unwrap();
+        let mut plain_doc = Document::new(plain_source.id, "text/plain", "hash-1", "v1");
+        plain_doc.title = Some("Cooking Guide".to_string());
+        documents::insert(&conn, &plain_doc).unwrap();
+        let plain_chunk = Chunk::new(plain_doc.id, "some unrelated body text here too", 0);
+        chunks::insert(&conn, &plain_chunk).unwrap();
+        let plain_vector = embedder.embed("some unrelated body text here too").unwrap();
+        embeddings::upsert(
+            &conn,
+            &Embedding::new(plain_chunk.id, embedder.model_name(), embedder.model_version(), plain_vector),
+        )
+        .unwrap();
+        drop(conn);
+
+        let request = ContextRequest::new("rust programming", 10_000).with_reranker(Arc::new(TitleOnlyReranker));
+        let packed = pack_context(&db, &embedder, &request).unwrap();
+        assert_eq!(packed.chunks.len(), 2);
+        assert_eq!(packed.chunks[0].hit.document_title.as_deref(), Some("Rust Programming Guide"));
+    }
+
+    #[test]
+    fn pack_context_without_reranker_skips_stage_two() {
+        // No `reranker` configured (the `Default`) — `pack_context`
+        // must not error or alter behavior; this is a regression
+        // guard for the `None` branch alongside the `Some` branch
+        // exercised by `pack_context_applies_configured_reranker`.
+        let embedder = HashingEmbedder::default_dim();
+        let db = seed_multi_source(&["rust programming language one", "rust programming language two"], &embedder);
+        let request = ContextRequest::new("rust programming", 10_000);
+        assert!(request.reranker.is_none());
+        let packed = pack_context(&db, &embedder, &request).unwrap();
+        assert_eq!(packed.chunks.len(), 2);
+    }
+
+    #[test]
+    fn pack_context_expands_neighbor_chunks_when_enabled() {
+        let embedder = HashingEmbedder::default_dim();
+        // `candidate_pool: 1` forces `hybrid_search` to return only
+        // the single best-matching chunk, so chunk 0 and chunk 2
+        // never enter the main pack on their own merit — only
+        // neighbor expansion can bring them in.
+        let db = seed_single_document(
+            &[
+                "completely unrelated filler content",
+                "rust programming language guide chapter",
+                "more filler content that follows",
+            ],
+            &embedder,
+        );
+
+        let request = ContextRequest {
+            query: "rust programming language".to_string(),
+            token_budget: 10_000,
+            candidate_pool: 1,
+            neighbor_expansion: true,
+            ..Default::default()
+        };
+        let packed = pack_context(&db, &embedder, &request).unwrap();
+        assert_eq!(packed.chunks.len(), 3);
+        // Order follows document order around the originally-selected
+        // chunk: previous neighbor, the chunk itself, next neighbor.
+        assert_eq!(packed.chunks[0].hit.text, "completely unrelated filler content");
+        assert_eq!(packed.chunks[1].hit.text, "rust programming language guide chapter");
+        assert_eq!(packed.chunks[2].hit.text, "more filler content that follows");
+    }
+
+    #[test]
+    fn pack_context_neighbor_expansion_respects_token_budget() {
+        let embedder = HashingEmbedder::default_dim();
+        let neighbor_text = "padding text shared by both neighbor chunks";
+        let main_text = "rust programming language chapter core content";
+        let db = seed_single_document(&[neighbor_text, main_text, neighbor_text], &embedder);
+
+        // Budget for exactly the main chunk plus one identical-sized
+        // neighbor — not both.
+        let token_budget = estimate_tokens(main_text) + estimate_tokens(neighbor_text);
+
+        let request = ContextRequest {
+            query: "rust programming language".to_string(),
+            token_budget,
+            candidate_pool: 1,
+            neighbor_expansion: true,
+            ..Default::default()
+        };
+        let packed = pack_context(&db, &embedder, &request).unwrap();
+        // The previous neighbor is tried before the next one (see
+        // `expand_with_neighbors`), so it wins the remaining budget.
+        assert_eq!(packed.chunks.len(), 2);
+        assert_eq!(packed.chunks[0].hit.text, neighbor_text);
+        assert_eq!(packed.chunks[1].hit.text, main_text);
+        assert!(packed.estimated_tokens <= token_budget);
+    }
+
+    #[test]
+    fn pack_context_neighbor_expansion_disabled_by_default() {
+        let embedder = HashingEmbedder::default_dim();
+        let db = seed_single_document(
+            &["filler before", "rust programming language chapter", "filler after"],
+            &embedder,
+        );
+
+        let request = ContextRequest {
+            query: "rust programming language".to_string(),
+            token_budget: 10_000,
+            candidate_pool: 1,
+            ..Default::default()
+        };
+        assert!(!request.neighbor_expansion);
         let packed = pack_context(&db, &embedder, &request).unwrap();
         assert_eq!(packed.chunks.len(), 1);
     }

@@ -183,18 +183,38 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_chunk ON embeddings(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model_name, model_version);
+
+-- Message embeddings: vector embeddings of conversation message
+-- content (Phase 8 follow-up — see ROADMAP.md). Mirrors `embeddings`
+-- exactly (same JSON-vector rationale, same uniqueness shape) but
+-- keyed on `message_id` instead of `chunk_id`, as a separate table
+-- rather than a shared/polymorphic one so neither table's foreign key
+-- or uniqueness constraint has to become conditional.
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    id            TEXT PRIMARY KEY,
+    message_id    TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    model_name    TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    dimension     INTEGER NOT NULL,
+    vector        TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    UNIQUE(message_id, model_name, model_version)
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_message ON message_embeddings(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_model ON message_embeddings(model_name, model_version);
 "#;
 
 /// Current schema version. Bump this and extend `apply` with a
 /// numbered migration step when the schema needs to change in a way
 /// that isn't safely idempotent (e.g. column removals/renames).
 ///
-/// v2 added the `embeddings` table (Phase 4). The `CREATE TABLE IF
-/// NOT EXISTS` above is itself idempotent/additive, so upgrading in
-/// place just means re-running `apply()`; this constant only exists
-/// to make the change visible in `schema_meta` and in future
-/// non-additive migrations.
-pub const SCHEMA_VERSION: i64 = 2;
+/// v2 added the `embeddings` table (Phase 4). v3 added the
+/// `message_embeddings` table (Phase 8 follow-up). Both are additive
+/// `CREATE TABLE IF NOT EXISTS`s, so upgrading in place just means
+/// re-running `apply()`; this constant only exists to make the
+/// change visible in `schema_meta` and in future non-additive
+/// migrations.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Apply the full schema to `conn`. Safe to call on every startup.
 pub fn apply(conn: &Connection) -> Result<()> {

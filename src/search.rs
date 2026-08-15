@@ -5,9 +5,12 @@
 //! Thin async wrappers over `mnemo-search`'s synchronous lexical,
 //! vector, and hybrid search so they fit the same
 //! `spawn_blocking`-backed pattern as the rest of the facade.
-//! Reranking (Phase 6) is not implemented yet — see ROADMAP.md.
-//! Context packing (Phase 7) lives in [`crate::context`] since it
-//! returns a different shape than a ranked hit list.
+//! Reranking (Phase 6) is an opt-in second stage over a candidate
+//! pool — see [`crate::Reranker`] / [`crate::HeuristicReranker`] and
+//! [`crate::ContextRequest::reranker`] — rather than something these
+//! plain search functions run on their own. Context packing (Phase 7)
+//! lives in [`crate::context`] since it returns a different shape
+//! than a ranked hit list.
 
 use std::sync::Arc;
 

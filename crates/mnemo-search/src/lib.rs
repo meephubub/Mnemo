@@ -14,21 +14,28 @@
 //!   deduplicated, token-budgeted, source-diverse packing of hybrid
 //!   candidates into a `PackedContext` ready to drop into a prompt
 //!   ([`context::pack_context`]).
+//! - Phase 6 ("Reranking", plan.md section 10 / section 82): an
+//!   optional second stage over a fused candidate pool via the
+//!   pluggable [`rerank::Reranker`] trait ([`rerank::rerank`]), with
+//!   [`rerank::HeuristicReranker`] as the default, dependency-free
+//!   implementation. Callers opt in explicitly — it is never forced
+//!   into [`hybrid_search`], and [`context::pack_context`] only runs
+//!   it when [`ContextRequest::reranker`] is set.
 //!
-//! Reranking (plan.md section 10 / Phase 6) is not implemented yet —
-//! see ROADMAP.md. Every search function here shares the same
-//! `SearchHit` shape (with `score` meaning "higher is better" in
-//! every case) so a caller can switch between them without touching
-//! downstream code.
+//! Every search function here shares the same `SearchHit` shape
+//! (with `score` meaning "higher is better" in every case) so a
+//! caller can switch between them without touching downstream code.
 
 pub mod context;
 pub mod error;
 pub mod hybrid;
+pub mod rerank;
 pub mod vector;
 
 pub use context::{pack_context, ContextChunk, ContextRequest, PackedContext};
 pub use error::{Result, SearchError};
 pub use hybrid::{hybrid_search, HybridWeights};
+pub use rerank::{rerank, HeuristicReranker, Reranker};
 pub use vector::vector_search;
 
 use mnemo_core::ids::{ChunkId, ConversationId, MessageId, SourceId};
@@ -166,9 +173,9 @@ pub fn search(db: &Db, query: &str, options: &SearchOptions) -> Result<Vec<Searc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mnemo_core::models::{Chunk, Document, Embedding, Source, SourceType};
+    use mnemo_core::models::{Chunk, Conversation, Document, Embedding, Message, MessageEmbedding, MessageRole, Source, SourceType};
     use mnemo_embeddings::{Embedder, HashingEmbedder};
-    use mnemo_storage::repositories::{chunks, documents, embeddings, sources};
+    use mnemo_storage::repositories::{chunks, conversations, documents, embeddings, message_embeddings, sources};
 
     /// Seed an in-memory db with one document made of a few chunks,
     /// and embed each chunk with `embedder`. Returns the db.
@@ -246,6 +253,85 @@ mod tests {
         let embedder = HashingEmbedder::default_dim();
         let db = seed(&["some text"], &embedder);
         let hits = vector::vector_search(&db, &embedder, "   ", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Seed an in-memory db with one conversation made of a few
+    /// messages, embedding each one with `embedder` into
+    /// `message_embeddings` (Phase 8 follow-up — see ROADMAP.md).
+    fn seed_messages(message_texts: &[&str], embedder: &dyn Embedder) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let conversation = Conversation::new(None);
+        conversations::insert_conversation(&conn, &conversation).unwrap();
+
+        for text in message_texts {
+            let message = Message::new(conversation.id, MessageRole::User, *text);
+            conversations::insert_message(&conn, &message).unwrap();
+
+            let vector = embedder.embed(text).unwrap();
+            let embedding = MessageEmbedding::new(message.id, embedder.model_name(), embedder.model_version(), vector);
+            message_embeddings::upsert(&conn, &embedding).unwrap();
+        }
+
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn vector_search_ranks_semantically_closer_message_first() {
+        let embedder = HashingEmbedder::default_dim();
+        let db = seed_messages(
+            &["the rust programming language is fast", "french cooking recipes are delicious"],
+            &embedder,
+        );
+
+        let hits = vector::vector_search(&db, &embedder, "rust programming language", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].kind, HitKind::Message);
+        assert!(hits[0].text.contains("rust"));
+        assert!(hits[0].message_id.is_some());
+        assert!(hits[0].conversation_id.is_some());
+    }
+
+    #[test]
+    fn hybrid_search_fuses_message_vector_hit_with_lexical_hit() {
+        let embedder = HashingEmbedder::default_dim();
+        let db = seed_messages(
+            &["the rust programming language is fast", "french cooking recipes are delicious"],
+            &embedder,
+        );
+
+        let hits = hybrid::hybrid_search(
+            &db,
+            &embedder,
+            "rust programming",
+            &SearchOptions::default(),
+            HybridWeights::default(),
+        )
+        .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].kind, HitKind::Message);
+        assert!(hits[0].text.contains("rust"));
+    }
+
+    #[test]
+    fn hybrid_search_documents_scope_excludes_message_vector_hits() {
+        let embedder = HashingEmbedder::default_dim();
+        let db = seed_messages(&["the rust programming language is fast"], &embedder);
+
+        let hits = hybrid::hybrid_search(
+            &db,
+            &embedder,
+            "rust programming",
+            &SearchOptions {
+                scope: SearchScope::Documents,
+                limit: 10,
+            },
+            HybridWeights::default(),
+        )
+        .unwrap();
         assert!(hits.is_empty());
     }
 }

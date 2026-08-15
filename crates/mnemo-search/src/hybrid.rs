@@ -8,19 +8,34 @@
 //!
 //! Fusion strategy: min-max normalize each candidate list to `[0, 1]`
 //! independently (so BM25's and cosine's very different scales don't
-//! bias the result), then combine matching chunks with a weighted
-//! sum. A hit that only one retriever found still competes, using its
-//! normalized score from the list it appeared in and `0.0` from the
-//! other.
+//! bias the result), then combine matching hits (chunk or message)
+//! with a weighted sum. A hit that only one retriever found still
+//! competes, using its normalized score from the list it appeared in
+//! and `0.0` from the other.
 
 use std::collections::HashMap;
 
-use mnemo_core::ids::ChunkId;
+use mnemo_core::ids::{ChunkId, MessageId};
 use mnemo_embeddings::Embedder;
 use mnemo_storage::Db;
 
 use crate::error::Result;
-use crate::{search, vector, SearchHit, SearchOptions};
+use crate::{search, vector, HitKind, SearchHit, SearchOptions};
+
+/// Fusion key: a hit's identity across the lexical and vector
+/// candidate lists, regardless of whether it's a chunk or a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HitKey {
+    Chunk(ChunkId),
+    Message(MessageId),
+}
+
+fn hit_key(hit: &SearchHit) -> Option<HitKey> {
+    match hit.kind {
+        HitKind::Chunk => hit.chunk_id.map(HitKey::Chunk),
+        HitKind::Message => hit.message_id.map(HitKey::Message),
+    }
+}
 
 /// Weights applied to each retrieval signal during fusion. Both
 /// default to `0.5`; the values don't need to sum to 1 — they're
@@ -56,10 +71,12 @@ fn min_max_normalize(hits: &[SearchHit]) -> Vec<f64> {
 /// results into a single ranked list via weighted, min-max normalized
 /// score fusion.
 ///
-/// Only chunk hits (not conversation messages) participate in vector
-/// fusion today — messages aren't embedded yet (see ROADMAP.md) — so
-/// message hits from the lexical pass are appended after fused chunk
-/// hits, each keeping its normalized lexical score.
+/// Both chunk and conversation-message hits participate in vector
+/// fusion (messages are embedded the same way chunks are — see
+/// [`crate::vector::vector_search`]). `vector_search` itself doesn't
+/// take a scope, so its results are filtered here to match
+/// `options.scope` before fusing, the same way the lexical pass
+/// already restricts itself to chunks/messages per scope.
 pub fn hybrid_search(
     db: &Db,
     embedder: &dyn Embedder,
@@ -77,35 +94,37 @@ pub fn hybrid_search(
         ..*options
     };
     let lexical_hits = search(db, query, &lexical_options)?;
-    let vector_hits = vector::vector_search(db, embedder, query, candidate_limit)?;
+    let vector_hits: Vec<SearchHit> = vector::vector_search(db, embedder, query, candidate_limit)?
+        .into_iter()
+        .filter(|hit| match (hit.kind, options.scope) {
+            (_, crate::SearchScope::All) => true,
+            (HitKind::Chunk, crate::SearchScope::Documents) => true,
+            (HitKind::Message, crate::SearchScope::Conversations) => true,
+            _ => false,
+        })
+        .collect();
 
     let lexical_norm = min_max_normalize(&lexical_hits);
     let vector_norm = min_max_normalize(&vector_hits);
 
-    // Fuse chunk hits by id; carry lexical message hits through
-    // untouched (normalized, lexical-weighted only).
-    let mut fused: HashMap<ChunkId, (f64, SearchHit)> = HashMap::new();
-    let mut message_hits: Vec<(f64, SearchHit)> = Vec::new();
+    // Fuse hits (chunk or message) by identity.
+    let mut fused: HashMap<HitKey, (f64, SearchHit)> = HashMap::new();
 
     for (hit, norm_score) in lexical_hits.into_iter().zip(lexical_norm) {
-        match hit.chunk_id {
-            Some(id) => {
-                fused.insert(id, (norm_score * weights.lexical_weight, hit));
-            }
-            None => message_hits.push((norm_score * weights.lexical_weight, hit)),
-        }
+        let Some(key) = hit_key(&hit) else { continue };
+        fused.insert(key, (norm_score * weights.lexical_weight, hit));
     }
 
     for (hit, norm_score) in vector_hits.into_iter().zip(vector_norm) {
-        let Some(id) = hit.chunk_id else { continue };
+        let Some(key) = hit_key(&hit) else { continue };
         let weighted = norm_score * weights.vector_weight;
         fused
-            .entry(id)
+            .entry(key)
             .and_modify(|(score, _)| *score += weighted)
             .or_insert_with(|| (weighted, hit));
     }
 
-    let mut results: Vec<(f64, SearchHit)> = fused.into_values().chain(message_hits).collect();
+    let mut results: Vec<(f64, SearchHit)> = fused.into_values().collect();
     results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(options.limit);
 
