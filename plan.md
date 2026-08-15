@@ -28,7 +28,6 @@ Mnemo combines:
 * Background ingestion
 * Local embeddings
 * Optional local LLM processing
-* MCP/API access
 * Evaluation and benchmarking
 
 Mnemo is designed to sit underneath an AI agent and provide the agent with the smallest, highest-quality set of relevant information required to complete a task.
@@ -165,12 +164,7 @@ The agent should be able to:
 
 G9 — Agent integration
 
-Mnemo should expose a clean Rust API and eventually:
-
-* REST API
-* OpenAI-compatible retrieval interface where useful
-* MCP server
-* CLI
+Mnemo should expose a clean Rust API ONLY, no mcp or server and should operate entirely within a rust crate, easily installable.
 
 ⸻
 
@@ -183,7 +177,6 @@ Mnemo should NOT initially attempt to become:
 * A cloud-scale distributed database
 * A general-purpose document editor
 * A replacement for an LLM
-* A replacement for Needle 2
 * A replacement for an embedding model
 * A replacement for an email client
 * A full enterprise knowledge-management platform
@@ -243,6 +236,7 @@ Mnemo is the persistent context layer for agents.
                           |
                           v
                        Results
+(the tool router and gemma/reasoning models are not in the scope of this project)
 
 ⸻
 
