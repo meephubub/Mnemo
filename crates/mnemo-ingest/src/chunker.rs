@@ -6,7 +6,7 @@
 //! without sections), and packs consecutive paragraphs up to a
 //! target character budget rather than cutting mid-sentence.
 
-use crate::parsers::ParsedFile;
+use crate::parsers::{ParsedFile, ParsedSection};
 
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
@@ -34,24 +34,27 @@ pub struct ChunkDraft {
     pub section: Option<String>,
     pub start_offset: usize,
     pub end_offset: usize,
+    /// 1-based page number, when the source section came from a
+    /// paginated format (currently: PDF).
+    pub page: Option<u32>,
 }
 
 pub fn chunk_parsed_file(parsed: &ParsedFile, config: &ChunkConfig) -> Vec<ChunkDraft> {
     let mut drafts = Vec::new();
 
-    for (heading, section_text, section_start) in &parsed.sections {
-        drafts.extend(chunk_section(heading.clone(), section_text, *section_start, config));
+    for section in &parsed.sections {
+        drafts.extend(chunk_section(section, config));
     }
 
     drafts
 }
 
-fn chunk_section(
-    heading: Option<String>,
-    text: &str,
-    section_start: usize,
-    config: &ChunkConfig,
-) -> Vec<ChunkDraft> {
+fn chunk_section(section: &ParsedSection, config: &ChunkConfig) -> Vec<ChunkDraft> {
+    let heading = section.heading.clone();
+    let text = section.text.as_str();
+    let section_start = section.start_offset;
+    let page = section.page;
+
     let paragraphs: Vec<(&str, usize)> = split_paragraphs_with_offsets(text);
     let mut drafts: Vec<ChunkDraft> = Vec::new();
 
@@ -71,6 +74,7 @@ fn chunk_section(
                 section: heading.clone(),
                 start_offset: section_start + buf_start.unwrap_or(0),
                 end_offset: section_start + buf_end,
+                page,
             });
             buf.clear();
             buf_start = None;
@@ -100,6 +104,7 @@ fn chunk_section(
                     section: heading.clone(),
                     start_offset: section_start + buf_start.unwrap_or(0),
                     end_offset: section_start + buf_end,
+                    page,
                 });
             }
         } else {
@@ -108,6 +113,7 @@ fn chunk_section(
                 section: heading,
                 start_offset: section_start + buf_start.unwrap_or(0),
                 end_offset: section_start + buf_end,
+                page,
             });
         }
     }
@@ -141,7 +147,12 @@ mod tests {
             kind: FileKind::Text,
             title: None,
             text: text.to_string(),
-            sections: vec![(None, text.to_string(), 0)],
+            sections: vec![ParsedSection {
+                heading: None,
+                text: text.to_string(),
+                start_offset: 0,
+                page: None,
+            }],
         }
     }
 
@@ -204,10 +215,33 @@ mod tests {
             kind: FileKind::Markdown,
             title: None,
             text: "Some body text.".to_string(),
-            sections: vec![(Some("Intro".to_string()), "Some body text.".to_string(), 0)],
+            sections: vec![ParsedSection {
+                heading: Some("Intro".to_string()),
+                text: "Some body text.".to_string(),
+                start_offset: 0,
+                page: None,
+            }],
         };
         let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].section.as_deref(), Some("Intro"));
+    }
+
+    #[test]
+    fn page_number_is_carried_onto_chunks() {
+        let parsed = ParsedFile {
+            kind: FileKind::Pdf,
+            title: None,
+            text: "Page two text.".to_string(),
+            sections: vec![ParsedSection {
+                heading: None,
+                text: "Page two text.".to_string(),
+                start_offset: 0,
+                page: Some(2),
+            }],
+        };
+        let drafts = chunk_parsed_file(&parsed, &ChunkConfig::default());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].page, Some(2));
     }
 }

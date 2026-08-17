@@ -28,11 +28,20 @@ library.
   `Db::open`/`Db::open_in_memory`. Repository modules provide typed
   CRUD over every table, including `repositories::embeddings`.
 - **Phase 2 — Document Ingestion (partial).** Plain text, Markdown
-  (heading-aware sectioning), and a dependency-free HTML-to-text pass.
-  Paragraph-aware chunking with a target/min character budget.
-  Content-hash based dedup so re-ingesting an unchanged file/text is a
-  no-op (`IngestOutcome::Unchanged`). **Not done:** PDF, DOCX, and
-  email parsing (plan.md still calls these out under Phase 2).
+  (heading-aware sectioning), a hand-rolled HTML-to-text pass,
+  PDF (`pdf-extract`, one section per page with an accurate 1-based
+  `Chunk::page`), and DOCX (`.docx` is a ZIP container; a hand-rolled
+  scan of `word/document.xml` sections on Word's
+  built-in heading styles and pulls the title from `docProps/core.xml`
+  or a `Title`-styled paragraph). `parsers::parse` now takes raw bytes
+  rather than a UTF-8 string so binary formats share the same pipeline
+  as text ones; `ingest_path`/`ingest_bytes_with_config` read/accept
+  bytes accordingly, and `Chunk::page` is threaded through end-to-end
+  from parsing to persistence. Paragraph-aware chunking with a
+  target/min character budget. Content-hash based dedup so
+  re-ingesting an unchanged file/text is a no-op
+  (`IngestOutcome::Unchanged`). **Not done:** email parsing (plan.md
+  still calls this out under Phase 2).
 - **Phase 3 — Full-Text Search.** FTS5 virtual tables + triggers for
   `chunks` and `messages`, BM25 ranking, lexical search across both
   scopes via `mnemo_search::search` / `Mnemo::search().search()`.
@@ -217,18 +226,67 @@ library.
   redaction beyond the `Sensitivity` enum already on `Source`.
 - **Phase 20 — Evaluation.**
 - **Phase 21 — Optimization.**
-- **Phase 22 — Multimodal Knowledge.**
+- **Phase 22 — Multimodal Knowledge.** Includes a **CLAP/CLIP-style
+  joint embedding search** sub-feature: ingest images and audio
+  clips as first-class sources and make them searchable by a text
+  query (or by each other) via a shared embedding space, not just by
+  filename/metadata or a transcript. Sketch of how this slots into
+  the existing architecture rather than bolting on a parallel system:
+  - `mnemo-core`: new `Source`/`Document` kind(s) for image and audio
+    media (or a `MediaKind` alongside the existing `Sensitivity`/
+    provenance fields on `Source`) so a photo or clip is a `Source`
+    like any ingested file, plus enough metadata (duration, sample
+    rate, dimensions, codec) to render a citation back to it.
+  - `mnemo-ingest`: image/audio don't chunk into paragraphs the way
+    text does, so ingestion here means decoding the file
+    (`image`/`symphonia` are the natural pure-Rust choices, matching
+    this project's no-external-tool constraint used for
+    `pdf-extract`/`zip`) and producing the fixed-size input a
+    CLAP/CLIP model expects (a resampled waveform, or a resized
+    frame) rather than a `ParsedSection`/`ChunkDraft` — an audio clip
+    would still likely need to be windowed into fixed-length segments
+    for embedding, which *is* analogous to chunking.
+  - `mnemo-embeddings`: the current `Embedder` trait is `&str -> Vec<f32>`-only,
+    so it can't take an image or audio buffer as input, and a
+    CLAP/CLIP model has a *joint* text/audio (or text/image) space —
+    meaning the same model class must expose both a text-embedding
+    path and a media-embedding path into that shared space. This
+    needs a new trait (e.g. `MultimodalEmbedder`, with `embed_text`
+    and `embed_audio`/`embed_image` methods returning vectors
+    comparable by cosine similarity to each other) rather than
+    reusing `Embedder` as-is, so a text query embeds into the same
+    space a stored clip's embedding lives in.
+  - `mnemo-storage`: a new table mirroring `embeddings`/
+    `message_embeddings`'s shape (keyed on a media/document id, model
+    name/version, dimension, vector) so it drops into the same
+    dedup/model-versioning pattern already established, rather than a
+    bespoke schema.
+  - `mnemo-search`: `vector_search` already merges multiple embedding
+    tables into one candidate pool by cosine score (it does this
+    today for `embeddings` + `message_embeddings`) — a media
+    embedding table is a third pool to merge the same way, so a text
+    query's `embed_text` vector can rank a photo or audio clip
+    alongside document chunks and messages in one hybrid search
+    without a separate "media search" API.
+  - Practical note: unlike the rest of this project's dependency-free/
+    pure-Rust posture (`HashingEmbedder`, `pdf-extract`, `zip`), a
+    real CLAP/CLIP model is a large pretrained neural net — running
+    one locally means an ONNX Runtime or Candle inference path (the
+    `Embedder` trait was already written with this in mind for text
+    models; the same reasoning applies to whatever multimodal trait
+    replaces/extends it here), which is a meaningfully bigger lift
+    than the hashing-trick default this project currently ships.
 - **Phase 23 — Connectors.**
 
 ## Suggested next steps
 
 1. Add `cargo test` coverage for the rest of `mnemo-storage`
-   repositories and `mnemo-ingest` chunking/parsing (still mostly
-   untested; only `mnemo-embeddings` and `mnemo-search` — plus, as of
-   this pass, `chunks::get_by_document_and_index` via
-   `mnemo-search`'s neighbor-expansion tests — have coverage).
-2. Phase 2: add PDF/DOCX parsers behind the existing `FileKind`
-   enum in `mnemo-ingest`.
+   repositories (still untested; `mnemo-embeddings`, `mnemo-search`,
+   and — as of this pass — `mnemo-ingest` all have coverage now, plus
+   `chunks::get_by_document_and_index` via `mnemo-search`'s
+   neighbor-expansion tests).
+2. ~~Phase 2: add PDF/DOCX parsers behind the existing `FileKind`
+   enum in `mnemo-ingest`.~~ Done this pass — see Phase 2 above.
 3. Phase 8: build a summarization/memory-extraction pipeline over
    conversation history (turning messages into `Memory`/
    `ProfileEntry` records via the confidence-threshold rules in
@@ -255,3 +313,12 @@ library.
    similar) could let callers ask for more than one chunk of
    surrounding context on either side, still gated by the token
    budget.
+8. Phase 22: CLAP/CLIP-style joint audio/image/text search (see Phase
+   22 above for the full sketch) — new `MultimodalEmbedder` trait in
+   `mnemo-embeddings`, image/audio decoding in `mnemo-ingest`, a media
+   embeddings table in `mnemo-storage` mirroring `embeddings`'s shape,
+   and a third pool for `vector_search`/`hybrid_search` to merge
+   alongside `embeddings`/`message_embeddings`. The biggest departure
+   from every other phase done so far: it requires an actual
+   pretrained model (ONNX/Candle inference), not a dependency-free
+   default like `HashingEmbedder`.

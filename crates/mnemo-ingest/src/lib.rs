@@ -41,17 +41,21 @@ pub fn ingest_path(path: &Path) -> Result<IngestedFile> {
 
 pub fn ingest_path_with_config(path: &Path, config: &ChunkConfig) -> Result<IngestedFile> {
     let kind = parsers::identify(path)?;
-    let raw = std::fs::read_to_string(path)?;
-    ingest_str_with_config(kind, &raw, config)
+    let raw = std::fs::read(path)?;
+    ingest_bytes_with_config(kind, &raw, config)
 }
 
 /// Same as [`ingest_path_with_config`] but for in-memory content
 /// (useful for tests, and for ingesting content that didn't come from
-/// a file, e.g. a pasted note).
-pub fn ingest_str_with_config(kind: FileKind, raw: &str, config: &ChunkConfig) -> Result<IngestedFile> {
+/// a file, e.g. a pasted note or an uploaded attachment).
+///
+/// Text-based formats (plain text, Markdown, HTML) must be valid
+/// UTF-8; binary container formats (PDF, DOCX) are parsed directly
+/// from bytes.
+pub fn ingest_bytes_with_config(kind: FileKind, raw: &[u8], config: &ChunkConfig) -> Result<IngestedFile> {
     let parsed = parsers::parse(kind, raw)?;
     let chunks = chunker::chunk_parsed_file(&parsed, config);
-    let content_hash = hash::content_hash(raw.as_bytes());
+    let content_hash = hash::content_hash(raw);
 
     Ok(IngestedFile {
         kind,
@@ -62,4 +66,79 @@ pub fn ingest_str_with_config(kind: FileKind, raw: &str, config: &ChunkConfig) -
         chunks,
         parser_version: PARSER_VERSION,
     })
+}
+
+/// Convenience wrapper for the text-based formats (plain text,
+/// Markdown, HTML): parse and chunk a UTF-8 string directly.
+///
+/// Returns [`IngestError::UnsupportedType`] for binary container
+/// formats (PDF, DOCX) — those don't have a meaningful "raw string"
+/// form; use [`ingest_bytes_with_config`] for them instead.
+pub fn ingest_str_with_config(kind: FileKind, raw: &str, config: &ChunkConfig) -> Result<IngestedFile> {
+    if parsers::is_binary(kind) {
+        return Err(IngestError::UnsupportedType(format!(
+            "{kind:?} is a binary format; use ingest_bytes_with_config instead of ingest_str_with_config"
+        )));
+    }
+    ingest_bytes_with_config(kind, raw.as_bytes(), config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parsers::pdf::test_support::build_minimal_pdf;
+
+    #[test]
+    fn identify_recognizes_pdf_and_docx_extensions() {
+        assert_eq!(parsers::identify(Path::new("report.pdf")).unwrap(), FileKind::Pdf);
+        assert_eq!(parsers::identify(Path::new("report.PDF")).unwrap(), FileKind::Pdf);
+        assert_eq!(parsers::identify(Path::new("memo.docx")).unwrap(), FileKind::Docx);
+    }
+
+    #[test]
+    fn ingest_bytes_end_to_end_for_pdf_produces_paged_chunks() {
+        let bytes = build_minimal_pdf("The quarterly report shows steady growth across all regions.");
+        let ingested = ingest_bytes_with_config(FileKind::Pdf, &bytes, &ChunkConfig::default()).unwrap();
+
+        assert_eq!(ingested.kind, FileKind::Pdf);
+        assert_eq!(ingested.mime_type, "application/pdf");
+        assert!(!ingested.chunks.is_empty());
+        assert_eq!(ingested.chunks[0].page, Some(1));
+        assert!(ingested.chunks[0].text.contains("quarterly report"));
+        // content hash is deterministic and derived from the raw bytes
+        assert_eq!(ingested.content_hash, hash::content_hash(&bytes));
+    }
+
+    #[test]
+    fn ingest_bytes_end_to_end_for_docx_produces_headed_chunks() {
+        use parsers::docx::test_support::{build_test_docx, DOC_NS};
+
+        let xml = format!(
+            r#"<w:document {DOC_NS}><w:body>
+                <w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Quarterly Report</w:t></w:r></w:p>
+                <w:p><w:r><w:t>Revenue grew steadily this quarter across all regions.</w:t></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let bytes = build_test_docx(&xml, None);
+        let ingested = ingest_bytes_with_config(FileKind::Docx, &bytes, &ChunkConfig::default()).unwrap();
+
+        assert_eq!(ingested.kind, FileKind::Docx);
+        assert_eq!(ingested.title.as_deref(), Some("Quarterly Report"));
+        assert!(!ingested.chunks.is_empty());
+        assert_eq!(ingested.chunks[0].section.as_deref(), Some("Quarterly Report"));
+        assert!(ingested.chunks[0].text.contains("Revenue grew steadily"));
+    }
+
+    #[test]
+    fn ingest_str_with_config_rejects_binary_kinds() {
+        let result = ingest_str_with_config(FileKind::Pdf, "not real pdf bytes", &ChunkConfig::default());
+        assert!(matches!(result, Err(IngestError::UnsupportedType(_))));
+    }
+
+    #[test]
+    fn ingest_str_with_config_still_works_for_plain_text() {
+        let ingested = ingest_str_with_config(FileKind::Text, "Hello, world.", &ChunkConfig::default()).unwrap();
+        assert_eq!(ingested.chunks.len(), 1);
+        assert_eq!(ingested.chunks[0].text, "Hello, world.");
+    }
 }

@@ -31,6 +31,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
 sha2 = "0.10"
+pdf-extract = "0.12"
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

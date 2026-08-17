@@ -33,7 +33,7 @@ src/                        # the `mnemo` facade crate
 crates/
   mnemo-core/                # data model, IDs, error type (no I/O)
   mnemo-storage/              # SQLite schema, migrations, repositories (incl. chunk + message embeddings), FTS5
-  mnemo-ingest/                # txt/md/html parsing + chunking (pure, no I/O beyond reading files)
+  mnemo-ingest/                # txt/md/html/pdf/docx parsing + chunking (pure, no I/O beyond reading files)
   mnemo-embeddings/             # Embedder trait + default HashingEmbedder (Phase 4)
   mnemo-search/                  # lexical (BM25), vector (cosine), hybrid fusion, reranking, context packing
   mnemo-cli/                      # `mnemo` binary — not covered by this file; see ROADMAP.md scope note
@@ -76,8 +76,9 @@ too:
 ```sh
 cargo run -p mnemo-cli -- --db mnemo.db init
 
-# Ingest documents (.txt, .md, .html)
+# Ingest documents (.txt, .md, .html, .pdf, .docx — extension picks the parser)
 cargo run -p mnemo-cli -- --db mnemo.db ingest ./notes/*.md
+cargo run -p mnemo-cli -- --db mnemo.db ingest ./reports/quarterly.pdf ./memos/notice.docx
 
 # Search everything that's been ingested (lexical/BM25 only)
 cargo run -p mnemo-cli -- --db mnemo.db search "project deadline"
@@ -194,14 +195,15 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-No dedicated tests have been written yet for `mnemo-storage` or
-`mnemo-ingest` (see `ROADMAP.md`) — `mnemo-storage`'s new
-`chunks::get_by_document_and_index` (added to support neighbor-chunk
-expansion) is exercised only indirectly, via `mnemo-search`'s
-neighbor-expansion tests, not a `mnemo-storage`-local test. But
-`mnemo-embeddings` and `mnemo-search` (lexical/vector/hybrid search,
-reranking, and context packing, including neighbor expansion) both
-include unit tests — `cargo test` will run those.
+No dedicated tests have been written yet for `mnemo-storage` (see
+`ROADMAP.md`) — its `chunks::get_by_document_and_index` (added to
+support neighbor-chunk expansion) is exercised only indirectly, via
+`mnemo-search`'s neighbor-expansion tests, not a `mnemo-storage`-local
+test. But `mnemo-embeddings`, `mnemo-search` (lexical/vector/hybrid
+search, reranking, and context packing, including neighbor expansion),
+and `mnemo-ingest` (parsing for every supported format — txt/md/html/
+PDF/DOCX — plus chunking and the crate-level `ingest_*` entry points)
+all include unit tests — `cargo test` will run those.
 
 To verify just the Phase 4 (embeddings)/Phase 5 (hybrid retrieval)/
 Phase 6 (reranking)/Phase 7 (context packing) work without running the
@@ -213,9 +215,43 @@ cargo test -p mnemo-search
 cargo test -p mnemo-embeddings
 ```
 
+To verify just the PDF/DOCX ingestion work (plan.md Phase 2 follow-up):
+
+```sh
+cargo check -p mnemo-ingest -p mnemo --all-targets
+cargo test -p mnemo-ingest
+```
+
 None of the commands in this file have been run in this environment —
 they're recorded here so the exact build/test/lint steps are known,
 per project direction to document commands rather than execute them.
+
+## PDF/DOCX ingestion dependencies
+
+`mnemo-ingest` added two new dependencies to parse PDF and DOCX files
+(plan.md Phase 2's PDF/DOCX ingestion follow-up):
+
+- **`pdf-extract`** — pure-Rust PDF text extraction (via `lopdf`
+  underneath); no system libraries (no `poppler`, no `mupdf`)
+  required. `parsers::pdf` uses its per-page extraction so each
+  resulting chunk keeps an accurate 1-based `page` number
+  (`Chunk::page`).
+- **`zip`**, with `default-features = false, features =
+  ["deflate-flate2-zlib-rs"]` — `.docx` files are ZIP containers; this
+  feature set is the minimal one that can still *read* the standard
+  Deflate-compressed entries real Word produces (via the pure-Rust
+  `zlib-rs` backend, no system zlib), without pulling in the
+  zopfli/bzip2/lzma/ppmd/AES encoders bundled in `zip`'s `default`
+  features (none of which ingestion needs). `parsers::docx` reads
+  `word/document.xml` (body text, paragraph-level heading styles) and
+  `docProps/core.xml` (document title) directly out of the archive
+  with a small dependency-free XML scan — no XML/DOM crate was added.
+
+Both parsers are exercised by unit tests that build minimal, valid
+PDF/DOCX byte fixtures entirely in Rust (`parsers::pdf::test_support`,
+`parsers::docx::test_support`) — no binary fixture files are checked
+into the repo, and no external tool (e.g. a real copy of Word, or a
+Python PDF library) was used to generate them.
 
 ## Why no crates were added via `cargo add`
 

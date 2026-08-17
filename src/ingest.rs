@@ -153,7 +153,7 @@ fn persist(
             text: draft.text,
             start_offset: draft.start_offset,
             end_offset: draft.end_offset,
-            page: None,
+            page: draft.page,
             section: draft.section,
             chunk_index: index,
         })
