@@ -140,9 +140,25 @@ CREATE TABLE IF NOT EXISTS memories (
     valid_from     TEXT,
     valid_until    TEXT,
     source_id      TEXT REFERENCES sources(id) ON DELETE SET NULL,
-    superseded_by  TEXT REFERENCES memories(id) ON DELETE SET NULL
+    superseded_by  TEXT REFERENCES memories(id) ON DELETE SET NULL,
+    -- When `status` last changed (v4). Gates the SUPERSEDED/EXPIRED
+    -- -> ARCHIVED transition behind a grace period instead of
+    -- archiving immediately (plan.md section 25 "Memory Lifecycle").
+    -- Backfilled from `created_at` for rows that predate this column
+    -- — see `ensure_column` below.
+    status_changed_at TEXT,
+    -- Decay-maintenance anchor (v5, plan.md section 26 "Memory
+    -- Importance"): advanced to "now" every time importance decay
+    -- runs for this memory, so re-running decay doesn't re-decay the
+    -- same elapsed interval, and a genuine access (which bumps
+    -- `last_accessed` past this) resets the decay clock. Backfilled
+    -- from `created_at` for rows that predate this column.
+    last_decay_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+-- idx_memories_status_changed_at is created in `apply()` in Rust,
+-- after `ensure_column` guarantees the column exists on databases
+-- created before v4 — see below.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
@@ -209,22 +225,68 @@ CREATE INDEX IF NOT EXISTS idx_message_embeddings_model ON message_embeddings(mo
 /// that isn't safely idempotent (e.g. column removals/renames).
 ///
 /// v2 added the `embeddings` table (Phase 4). v3 added the
-/// `message_embeddings` table (Phase 8 follow-up). Both are additive
-/// `CREATE TABLE IF NOT EXISTS`s, so upgrading in place just means
-/// re-running `apply()`; this constant only exists to make the
-/// change visible in `schema_meta` and in future non-additive
-/// migrations.
-pub const SCHEMA_VERSION: i64 = 3;
+/// `message_embeddings` table (Phase 8 follow-up). v4 added the
+/// `memories.status_changed_at` column and v5 added
+/// `memories.last_decay_at` (both Phase 10 follow-up — memory
+/// lifecycle maintenance's archival step needs to know how long a
+/// memory has sat in `SUPERSEDED`/`EXPIRED`, and decay needs an
+/// anchor independent of `last_accessed`). The first three are
+/// additive `CREATE TABLE IF NOT EXISTS`s; v4/v5 are column additions
+/// to an existing table, which SQLite's `CREATE TABLE IF NOT EXISTS`
+/// cannot retrofit on its own — see `ensure_column` below for the
+/// explicit `ALTER TABLE`/backfill these bumps correspond to.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Apply the full schema to `conn`. Safe to call on every startup.
 pub fn apply(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|e| StorageError::Migration(e.to_string()))?;
+    ensure_column(conn, "memories", "status_changed_at", "created_at")?;
+    ensure_column(conn, "memories", "last_decay_at", "created_at")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_status_changed_at ON memories(status_changed_at)",
+        [],
+    )
+    .map_err(|e| StorageError::Migration(e.to_string()))?;
     conn.execute(
         "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![SCHEMA_VERSION.to_string()],
     )
     .map_err(|e| StorageError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Add `TEXT` column `column` to `table` and backfill it from
+/// `backfill_from` (another column on the same table) for any
+/// database created before the column existed. `SCHEMA_SQL`'s
+/// `CREATE TABLE IF NOT EXISTS` already declares every current
+/// column for brand-new databases, so this is a no-op on those — it
+/// only does real work on a database that already has `table` but
+/// predates `column`. SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+/// column existence is checked via `PRAGMA table_info` first.
+///
+/// `table`/`column`/`backfill_from` are always trusted, hard-coded
+/// call-site literals (see `apply` above) — never user input — so
+/// interpolating them into the `ALTER TABLE`/`UPDATE` statements
+/// below is safe; `rusqlite` has no bind-parameter syntax for
+/// identifiers, only values.
+fn ensure_column(conn: &Connection, table: &str, column: &str, backfill_from: &str) -> Result<()> {
+    let has_column = conn
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"))
+        .map_err(|e| StorageError::Migration(e.to_string()))?
+        .exists([])
+        .map_err(|e| StorageError::Migration(e.to_string()))?;
+
+    if !has_column {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+            .map_err(|e| StorageError::Migration(e.to_string()))?;
+        conn.execute(
+            &format!("UPDATE {table} SET {column} = {backfill_from} WHERE {column} IS NULL"),
+            [],
+        )
+        .map_err(|e| StorageError::Migration(e.to_string()))?;
+    }
+
     Ok(())
 }

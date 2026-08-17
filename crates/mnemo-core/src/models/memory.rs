@@ -51,6 +51,19 @@ pub struct Memory {
     /// is recorded here rather than deleting historical evidence
     /// (section 25 / section 29 "Contradiction Detection").
     pub superseded_by: Option<MemoryId>,
+    /// When [`Self::status`] last changed. Used to gate the
+    /// `SUPERSEDED`/`EXPIRED` -> `ARCHIVED` transition behind a grace
+    /// period (section 25) rather than archiving immediately, so a
+    /// just-superseded memory stays easy to find for a while.
+    pub status_changed_at: DateTime<Utc>,
+    /// Anchor timestamp for importance decay (section 26). Distinct
+    /// from `last_accessed` (which reflects genuine retrieval usage)
+    /// so that running decay maintenance repeatedly doesn't
+    /// re-decay the same elapsed interval every time it's called —
+    /// each decay pass advances this to `now`, and a later access
+    /// that bumps `last_accessed` past it effectively resets the
+    /// decay clock for that memory.
+    pub last_decay_at: DateTime<Utc>,
 }
 
 impl Memory {
@@ -69,6 +82,8 @@ impl Memory {
             valid_until: None,
             source_id: None,
             superseded_by: None,
+            status_changed_at: now,
+            last_decay_at: now,
         }
     }
 

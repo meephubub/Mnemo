@@ -9,6 +9,7 @@
 
 pub mod error;
 pub mod ids;
+pub mod math;
 pub mod models;
 
 pub use error::{MnemoError, Result};

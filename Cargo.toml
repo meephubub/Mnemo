@@ -38,6 +38,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
+# Real local embedding model backend (Phase 4 follow-up, mnemo-embeddings::bert).
+# Pinned together at 0.10.2: candle-transformers 0.10.2 requires
+# candle-core/candle-nn ^0.10.2 exactly (a newer 0.11.x candle-core/nn
+# exists upstream, but candle-transformers has not been re-published
+# against it yet), so all three are pinned to the same released,
+# mutually-compatible version rather than picking the newest available
+# per-crate.
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
+# `ureq` (not `tokio`/`native-tls`) keeps this on a synchronous,
+# pure-Rust-TLS (rustls, ureq's default backend) HTTP client — no
+# system OpenSSL dependency and no tokio runtime needed just to
+# download model weights once and cache them under
+# `~/.cache/huggingface/hub` (or `$HF_HOME`), matching how
+# `hf_hub::api::sync::Api` is used in `mnemo-embeddings::bert`.
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+tokenizers = "0.23"
+
 # package that lives at the workspace root and provides the public
 # `mnemo` facade crate described in plan.md section 62 (Core API / Crate Structure).
 [package]
